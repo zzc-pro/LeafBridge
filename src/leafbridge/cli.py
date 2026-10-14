@@ -1,10 +1,14 @@
 """Command-line entry point for LeafBridge."""
 
 import argparse
+import json
 import math
+from pathlib import Path
 import sys
+import tempfile
 
-from .client import OverleafError, OverleafClient
+from . import git
+from .client import BASE_URL, OverleafError, OverleafClient
 from .sync import clone
 
 
@@ -17,6 +21,50 @@ def _timeout(value):
     if not math.isfinite(seconds) or seconds <= 0:
         raise argparse.ArgumentTypeError("Timeout must be a positive number.")
     return seconds
+
+
+def add(api, name=None, project_id=None, path=None):
+    """Associate an existing working tree with one active project without transferring files."""
+    if (name is None) == (project_id is None) or not (name or project_id):
+        raise OverleafError("Specify an exact project name or --id, but not both.")
+    root = git.root(path)
+    metadata = root / ".leafbridge"
+    if metadata.is_symlink() or metadata.resolve().parent != root:
+        raise OverleafError("The repository .leafbridge must not be a symbolic link or point outside the repository.")
+    previous = None
+    try:
+        if metadata.exists():
+            config = metadata / "config.json"
+            if not metadata.is_dir() or config.is_symlink() or not config.is_file():
+                raise OverleafError("Existing LeafBridge metadata is incomplete or unsafe. Check .leafbridge.")
+            previous = json.loads(config.read_text(encoding="utf-8"))
+            if not isinstance(previous, dict) or not previous.get("project_id"):
+                raise OverleafError("Existing LeafBridge configuration is invalid. Check .leafbridge/config.json.")
+        key, value = ("id", project_id) if project_id is not None else ("name", name)
+        matches = [project for project in api.projects() if project[key] == value]
+        if not matches:
+            raise OverleafError(f"No active project with {key} {value!r}. Run leaf list to check projects.")
+        if len(matches) != 1:
+            raise OverleafError("Multiple active projects match. Use leaf remote add --id PROJECT_ID.")
+        project = matches[0]
+        if previous is not None:
+            if previous.get("base_url") == BASE_URL and previous["project_id"] == project["id"]:
+                return root, project, False
+            raise OverleafError("This repository is already associated with another project. Existing configuration was preserved.")
+        with tempfile.TemporaryDirectory(prefix=".leafbridge-add-", dir=root) as temporary:
+            staged = Path(temporary) / "metadata"
+            staged.mkdir()
+            config = {"base_url": BASE_URL, "project_id": project["id"], "name": project["name"]}
+            for filename, payload in [("config.json", config), ("state.json", {"version": 1, "files": {}})]:
+                (staged / filename).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                                               encoding="utf-8")
+            git.ignore(root)
+            if metadata.exists() or metadata.is_symlink():
+                raise OverleafError("LeafBridge metadata appeared during setup. Try again after checking .leafbridge.")
+            staged.rename(metadata)
+    except (OSError, ValueError, UnicodeError):
+        raise OverleafError("Unable to associate the project. Check LeafBridge configuration and repository permissions.") from None
+    return root, project, True
 
 
 def main(argv=None):
@@ -32,8 +80,22 @@ def main(argv=None):
     clone_command = commands.add_parser("clone", help="Clone an active Overleaf project into a local Git repository.")
     clone_command.add_argument("name", help="Exact project name; always wrap it in double quotes.")
     clone_command.add_argument("directory", nargs="?", help="Local directory (default: the project name).")
+    remote = commands.add_parser("remote", help="Associate a local repository with Overleaf.")
+    actions = remote.add_subparsers(dest="action", required=True)
+    add_command = actions.add_parser("add", help="Associate this Git working tree with an active project.")
+    add_command.add_argument("name", nargs="?", help="Exact project name, wrapped in double quotes.")
+    add_command.add_argument("--id", dest="project_id", help="Project ID from leaf list, instead of a name.")
     args = parser.parse_args(argv)
+    if args.command == "remote" and ((args.name is None) == (args.project_id is None)
+                                      or not (args.name or args.project_id)):
+        add_command.error("specify an exact project name or --id, but not both")
+    operation = {"login": "Login", "list": "Listing projects", "clone": "Clone", "remote": "Remote add"}[args.command]
     try:
+        if args.command == "remote":
+            path, project, created = add(OverleafClient(), args.name, args.project_id)
+            message = "Project associated" if created else "Project already associated"
+            print(f"{message}: {project['name']!r} ({project['id']}) at {path}")
+            return 0
         if args.command == "clone":
             print(f"Cloning {args.name!r}...", flush=True)
             path = clone(OverleafClient(), args.name, args.directory)
@@ -54,11 +116,9 @@ def main(argv=None):
         print("Opening Overleaf in a new browser window. Complete login on the website, including CAPTCHA or SSO.", flush=True)
         session_path = OverleafClient().login(browser=args.browser, timeout=args.timeout)
     except OverleafError as error:
-        operation = {"login": "Login", "list": "Listing projects", "clone": "Clone"}[args.command]
         print(f"{operation} failed: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        operation = {"login": "Login", "list": "Listing projects", "clone": "Clone"}[args.command]
         print(f"\n{operation} cancelled.", file=sys.stderr)
         return 130
     print(f"Login successful. Session saved to: {session_path}")

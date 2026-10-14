@@ -1,6 +1,6 @@
 # LeafBridge
 
-A small command-line tool for exchanging files between local Git repositories and Overleaf. Login, project listing, and cloning are implemented. Push and pull synchronization is still under development.
+A small command-line tool for exchanging files between local Git repositories and Overleaf. Login, project listing, cloning, and associating existing repositories are implemented. Push and pull synchronization is still under development.
 
 ## Install with Conda
 
@@ -99,6 +99,29 @@ git commit -m "Import Overleaf source"
 ~~~
 
 Clone failures clean up newly created temporary files. Archive paths are checked to prevent extraction outside the destination or replacement of Git and LeafBridge metadata. The command only reads the remote project.
+
+## Associate an existing repository
+
+Run this command inside your existing Git working tree or any of its subdirectories:
+
+~~~powershell
+cd my-paper
+leaf remote add "My Paper"
+~~~
+
+The name must exactly match an active project in your saved Overleaf account session. The command does not open a browser. For duplicate names, use the project ID shown by `leaf list`:
+
+~~~powershell
+leaf remote add --id 0123456789abcdef01234567
+~~~
+
+Specify either a name or `--id`. Each local repository can be associated with one Overleaf project. This stores a LeafBridge association, leaving Git remotes such as `origin` unchanged; it does not require Overleaf's paid Git integration. Non-repositories and bare repositories are rejected.
+
+The command saves `base_url`, `project_id`, and `name` in `.leafbridge/config.json` at the working tree root and initializes `.leafbridge/state.json` with an empty file baseline. It preserves existing `.gitignore` rules and adds `/.leafbridge/` if absent. Local source files are preserved; no files are uploaded or downloaded, and no Git commit is created.
+
+Adding the same project again preserves the existing configuration and synchronization state. Adding a different project fails without replacing the association. Invalid or incomplete existing metadata must be checked before retrying. A failed project lookup does not create an association.
+
+The empty baseline represents a repository that has not yet synchronized. Future synchronization must treat differing local and remote versions of the same file as a first-sync conflict. `leaf remote add` provides the association workflow previously planned as `leaf init`; there is no separate `leaf init` command.
 
 ## Session storage
 
