@@ -4,15 +4,15 @@ A command-line tool for syncing working-tree files between local Git repositorie
 
 ## Install with Conda
 
-Run from the project root:
+Requires Python 3.10+ and Git. Install directly from GitHub without manually cloning the source repository:
 
 ~~~powershell
 conda create -n leafbridge python=3.11 pip -y
 conda activate leafbridge
-python -m pip install -e .
+python -m pip install git+https://github.com/zzc-pro/LeafBridge.git
 ~~~
 
-Editable installation picks up source changes immediately.
+Run these commands from any directory. Pip downloads the source temporarily and installs LeafBridge and its dependencies into the Conda environment. If you already have a suitable Python environment, only the pip command is needed.
 
 ## Log in
 
