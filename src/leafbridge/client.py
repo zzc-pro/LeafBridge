@@ -1,4 +1,4 @@
-"""Overleaf 浏览器登录和会话保存。"""
+"""Overleaf browser login, session storage, and project queries."""
 
 import json
 import math
@@ -14,12 +14,16 @@ BASE_URL = "https://www.overleaf.com"
 SESSION_COOKIES = {"overleaf_session2", "sharelatex.sid"}
 
 
-class LoginError(RuntimeError):
-    """可直接展示给用户的登录错误。"""
+class OverleafError(RuntimeError):
+    """An Overleaf operation error suitable for display to the user."""
 
 
-def default_session_path():
-    """会话存放在用户配置目录，与论文 Git 仓库分开。"""
+class LoginError(OverleafError):
+    """A login error suitable for display to the user."""
+
+
+def session_file():
+    """Store the session in the user configuration directory, outside Git repositories."""
     if sys.platform == "win32":
         directory = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
     elif sys.platform == "darwin":
@@ -29,7 +33,8 @@ def default_session_path():
     return directory / "leafbridge" / "session.json"
 
 
-def _validate_session(data):
+def _validate(data):
+    """Validate session fields and discard expired cookies."""
     if not isinstance(data, dict) or data.get("version") != 1 or data.get("base_url") != BASE_URL:
         raise LoginError("Unsupported session format. Run leaf login again.")
     csrf = data.get("csrf")
@@ -56,16 +61,17 @@ def _validate_session(data):
     return {**data, "cookies": valid_cookies}
 
 
-def _load_playwright():
+def _playwright():
+    """Load Playwright only when a browser or HTTP operation needs it."""
     try:
         from playwright.sync_api import Error, sync_playwright
     except ImportError:
-        raise LoginError("Login dependency is missing. Run python -m pip install -e . in the leafbridge Conda environment.") from None
+        raise LoginError("Playwright dependency is missing. Run python -m pip install -e . in the leafbridge Conda environment.") from None
     return sync_playwright, Error
 
 
-def _browser_executable(channel):
-    """优先定位已安装的浏览器，避免只依赖 Playwright 的默认安装路径。"""
+def _browser_path(channel):
+    """Find an installed browser instead of relying only on Playwright's default paths."""
     if channel == "chromium":
         return None
     commands = {"msedge": ["msedge", "microsoft-edge", "microsoft-edge-stable"],
@@ -101,20 +107,22 @@ def _browser_executable(channel):
 
 class OverleafClient:
     def __init__(self, session_path=None):
-        self.session_path = Path(session_path) if session_path is not None else default_session_path()
+        """Use the default user session file unless a custom path is provided."""
+        self.session_path = Path(session_path) if session_path is not None else session_file()
 
-    def load_session(self):
-        """读取并检查会话；服务器仍可能提前撤销未到期的 Cookie。"""
+    def load(self):
+        """Read and validate the session; the server may revoke cookies before expiry."""
         try:
             data = json.loads(self.session_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise LoginError("Not logged in. Run leaf login.") from None
         except (OSError, UnicodeError, json.JSONDecodeError):
             raise LoginError("Unable to read the session. Run leaf login again.") from None
-        return _validate_session(data)
+        return _validate(data)
 
-    def _save_session(self, data):
-        data = _validate_session(data)
+    def _save(self, data):
+        """Validate and atomically save session data, preserving the previous file on failure."""
+        data = _validate(data)
         directory = self.session_path.parent
         temporary_path = None
         try:
@@ -137,13 +145,82 @@ class OverleafClient:
                     pass
         return self.session_path
 
+    def projects(self):
+        """Query active projects using the saved session without launching a browser."""
+        session = self.load()
+        sync_playwright, request_error = _playwright()
+        try:
+            with sync_playwright() as playwright:
+                request = playwright.request.new_context(
+                    base_url=BASE_URL,
+                    storage_state={"cookies": session["cookies"], "origins": []},
+                    extra_http_headers={"X-CSRF-Token": session["csrf"], "Origin": BASE_URL,
+                                        "Referer": BASE_URL + "/project", "Accept": "application/json"},
+                    timeout=30_000,
+                )
+                try:
+                    projects, seen = [], set()
+                    page = {"size": 100}
+                    expected_total = None
+                    while True:
+                        response = request.post(
+                            "/api/project", max_redirects=0,
+                            data={"filters": {}, "sort": {"by": "lastUpdated", "order": "desc"}, "page": page},
+                        )
+                        if response.status == 401 or 300 <= response.status < 400:
+                            raise LoginError("Session is no longer authenticated. Run leaf login again.")
+                        if response.status == 403:
+                            raise LoginError("Overleaf denied the request. Run leaf login again to renew the session and browser verification.")
+                        if response.status == 429:
+                            raise OverleafError("Overleaf rate limit reached. Try again later.")
+                        if response.status != 200:
+                            raise OverleafError(f"Project listing failed (HTTP {response.status}).")
+                        try:
+                            payload = response.json()
+                        except ValueError:
+                            raise OverleafError("Overleaf did not return project JSON. Check login or API compatibility.") from None
+                        if (not isinstance(payload, dict) or not isinstance(payload.get("projects"), list)
+                                or type(payload.get("totalSize")) is not int or payload["totalSize"] < 0):
+                            raise OverleafError("Unexpected project response format. Overleaf may have changed its API.")
+                        total = payload["totalSize"]
+                        if expected_total is not None and total != expected_total:
+                            raise OverleafError("The project list changed during retrieval. Run leaf list again.")
+                        expected_total = total
+                        previous_count = len(projects)
+                        batch = payload["projects"]
+                        for item in batch:
+                            if (not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"]
+                                    or not isinstance(item.get("name"), str)
+                                    or any(key in item and not isinstance(item[key], bool) for key in ("archived", "trashed"))):
+                                raise OverleafError("Unexpected project data. Overleaf may have changed its API.")
+                            if item["id"] not in seen:
+                                seen.add(item["id"])
+                                projects.append({key: item[key] for key in
+                                                 ("id", "name", "archived", "trashed", "lastUpdated", "accessLevel")
+                                                 if key in item})
+                        if len(projects) > total:
+                            raise OverleafError("Project count does not match the server response. Run leaf list again.")
+                        if len(projects) == total:
+                            return [project for project in projects
+                                    if not project.get("archived") and not project.get("trashed")]
+                        if len(projects) == previous_count or not batch or page.get("lastId") == batch[-1]["id"]:
+                            raise OverleafError("Overleaf returned an incomplete project list. Pagination did not advance.")
+                        page = {"size": 100, "lastId": batch[-1]["id"]}
+                finally:
+                    try:
+                        request.dispose()
+                    except request_error:
+                        pass
+        except request_error:
+            raise OverleafError("Unable to query Overleaf. Check your connection and try again.") from None
+
     def login(self, browser="chrome", timeout=300):
-        """默认新开独立 Chrome 窗口，等待用户登录并保存会话 Cookie。"""
+        """Open a new Chrome window by default, wait for login, and save session cookies."""
         if browser not in {"auto", "edge", "chrome", "chromium"}:
             raise LoginError("Browser must be auto, edge, chrome, or chromium.")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
             raise LoginError("Login timeout must be a positive number.")
-        sync_playwright, browser_error = _load_playwright()
+        sync_playwright, browser_error = _playwright()
         channels = {"edge": "msedge", "chrome": "chrome", "chromium": "chromium"}
         candidates = ["chrome", "msedge", "chromium"] if browser == "auto" else [channels[browser]]
         try:
@@ -152,7 +229,7 @@ class OverleafClient:
                 for channel in candidates:
                     try:
                         options = {"channel": channel, "headless": False, "timeout": 30_000}
-                        executable = _browser_executable(channel)
+                        executable = _browser_path(channel)
                         if executable:
                             options["executable_path"] = executable
                         context = playwright.chromium.launch_persistent_context(profile, **options)
@@ -179,11 +256,11 @@ class OverleafClient:
                             try:
                                 token = current_page.locator('meta[name="ol-csrfToken"]').first.get_attribute("content", timeout=500)
                                 cookies = context.cookies(BASE_URL + "/project")
-                                data = _validate_session({"version": 1, "base_url": BASE_URL,
+                                data = _validate({"version": 1, "base_url": BASE_URL,
                                                           "csrf": token, "cookies": cookies})
                             except (browser_error, LoginError):
                                 continue
-                            return self._save_session(data)
+                            return self._save(data)
                         pages[0].wait_for_timeout(500)
                     raise LoginError("Login timed out. Session was not saved. Run leaf login again or increase --timeout.")
                 finally:

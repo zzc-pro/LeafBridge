@@ -1,3 +1,3 @@
-"""LeafBridge：连接本地 Git 仓库与 Overleaf。"""
+"""LeafBridge: connect local Git repositories and Overleaf."""
 
 __version__ = "0.1.0"
