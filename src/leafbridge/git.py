@@ -45,6 +45,35 @@ def ignore(path):
         raise OverleafError("Unable to update .gitignore. Check repository permissions.") from None
 
 
+def files(path):
+    """Return tracked and untracked nonignored paths using Git's own selection rules."""
+    try:
+        result = subprocess.run([check(), "-C", str(path), "ls-files", "--cached", "--others",
+                                 "--exclude-standard", "-z"], check=True,
+                                capture_output=True, timeout=30)
+        tracked = subprocess.run([check(), "-C", str(path), "ls-files", "--cached", "-z"],
+                                 check=True, capture_output=True, timeout=30)
+        return ({name for name in result.stdout.decode("utf-8").split("\0") if name},
+                {name for name in tracked.stdout.decode("utf-8").split("\0") if name})
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise OverleafError("Unable to list local Git files. Check Git and repository permissions.") from None
+
+
+def ignored(path, names):
+    """Ask Git which candidate paths are ignored, including paths absent locally."""
+    if not names:
+        return set()
+    try:
+        data = "".join(name + "\0" for name in sorted(names)).encode("utf-8")
+        result = subprocess.run([check(), "-C", str(path), "check-ignore", "--no-index", "-z", "--stdin"],
+                                input=data, capture_output=True, timeout=30)
+        if result.returncode not in {0, 1}:
+            raise OverleafError("Unable to check Git ignore rules.")
+        return {name for name in result.stdout.decode("utf-8").split("\0") if name}
+    except (OSError, UnicodeError, subprocess.SubprocessError):
+        raise OverleafError("Unable to check Git ignore rules. Check Git and repository permissions.") from None
+
+
 def init(path):
     """Initialize a local repository and ignore LeafBridge metadata without committing."""
     path = Path(path)

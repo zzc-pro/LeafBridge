@@ -1,6 +1,7 @@
 """Local project setup and file transfer workflows."""
 
 import hashlib
+from contextlib import nullcontext
 import io
 import json
 import os
@@ -15,39 +16,106 @@ from . import git
 from .client import BASE_URL, OverleafError
 
 
-def _unpack(data, root):
-    """Extract regular ZIP files within the target directory and record remote hashes."""
+def _path(name):
+    """Validate a relative source-file path before reading or extracting its contents."""
+    if (not isinstance(name, str) or not name or "\\" in name
+            or PurePosixPath(name).is_absolute()
+            or any(part in {".", ".."} or ":" in part or "\x00" in part for part in name.rstrip("/").split("/"))
+            or PurePosixPath(name).parts[0].casefold() in {".git", ".leafbridge"}
+            or (os.name == "nt" and any(PureWindowsPath(part).is_reserved()
+                                        or part.endswith((".", " ")) for part in PurePosixPath(name).parts))):
+        raise OverleafError("A source file has an unsafe or reserved path.")
+    return PurePosixPath(name)
+
+
+def _unpack(data, root=None):
+    """Hash safe ZIP entries and optionally extract them within a target directory."""
     hashes, seen = {}, set()
-    root = root.resolve()
+    root = root.resolve() if root is not None else None
     with zipfile.ZipFile(io.BytesIO(data)) as archive:
         for entry in archive.infolist():
-            parts = PurePosixPath(entry.filename).parts
+            parts = _path(entry.filename).parts
             mode = stat.S_IFMT(entry.external_attr >> 16)
-            if (not parts or PurePosixPath(entry.filename).is_absolute() or "\\" in entry.filename
-                    or any(part in {".", ".."} or ":" in part or "\x00" in part for part in parts)
-                    or parts[0].casefold() in {".git", ".leafbridge"}
-                    or mode not in {0, stat.S_IFREG, stat.S_IFDIR}
-                    or (os.name == "nt" and any(PureWindowsPath(part).is_reserved()
-                                                or part.endswith((".", " ")) for part in parts))):
+            if mode not in {0, stat.S_IFREG, stat.S_IFDIR}:
                 raise OverleafError("The project ZIP contains an unsafe or reserved path.")
-            target = root.joinpath(*parts).resolve()
-            if not target.is_relative_to(root) or target == root:
+            target = root.joinpath(*parts).resolve() if root is not None else None
+            if target is not None and (not target.is_relative_to(root) or target == root):
                 raise OverleafError("The project ZIP contains a path outside the clone directory.")
             if entry.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
+                if target is not None:
+                    target.mkdir(parents=True, exist_ok=True)
                 continue
-            key = os.path.normcase(str(target))
+            key = os.path.normcase(PurePosixPath(*parts).as_posix())
             if key in seen:
                 raise OverleafError("The project ZIP contains duplicate file paths.")
             seen.add(key)
-            target.parent.mkdir(parents=True, exist_ok=True)
+            if target is not None:
+                target.parent.mkdir(parents=True, exist_ok=True)
             digest = hashlib.sha256()
-            with archive.open(entry) as source, target.open("xb") as destination:
+            with archive.open(entry) as source, (target.open("xb") if target is not None else nullcontext()) as destination:
                 for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    destination.write(chunk)
+                    if destination is not None:
+                        destination.write(chunk)
                     digest.update(chunk)
             hashes[PurePosixPath(*parts).as_posix()] = digest.hexdigest()
     return hashes
+
+
+def compare(local, remote, base):
+    """Classify content differences against the last successful synchronization hash."""
+    if local == remote:
+        return "same" if local is not None else "missing both"
+    if base is None:
+        if local is None:
+            return "remote only"
+        if remote is None:
+            return "local only"
+        return "conflict"
+    if local != base and remote != base:
+        return "conflict"
+    if local is None:
+        return "missing local"
+    if remote is None:
+        return "missing remote"
+    return "local modified" if local != base else "remote modified"
+
+
+def status(api, root, project_id, base):
+    """Compare selected local files and the remote ZIP without changing files or baseline."""
+    try:
+        if not isinstance(base, dict):
+            raise OverleafError("Invalid synchronization baseline. Check .leafbridge/state.json.")
+        for name, digest in base.items():
+            if (_path(name).as_posix() != name or name.endswith("/")
+                    or not isinstance(digest, str) or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)):
+                raise OverleafError("Invalid synchronization baseline. Check .leafbridge/state.json.")
+        selected, tracked = git.files(root)
+        # Metadata is never a source file, even if it was accidentally tracked.
+        selected = {name for name in selected if PurePosixPath(name).parts[0].casefold() not in {".git", ".leafbridge"}}
+        local = {}
+        for name in sorted(selected):
+            relative = _path(name)
+            path = root.joinpath(*relative.parts)
+            if path.is_symlink() or not path.resolve().is_relative_to(root):
+                raise OverleafError(f"Local source path is a link or escapes the repository: {name!r}")
+            if not path.exists():
+                continue
+            if not path.is_file():
+                raise OverleafError(f"Local source path is not a regular file: {name!r}")
+            with path.open("rb") as stream:
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                local[name] = digest.hexdigest()
+        remote = _unpack(api.download(project_id))
+        names = selected | remote.keys() | base.keys()
+        names -= git.ignored(root, names - tracked)
+        return {name: compare(local.get(name), remote.get(name), base.get(name)) for name in sorted(names)}
+    except OverleafError:
+        raise
+    except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error):
+        raise OverleafError("Unable to compare project files. Check local permissions and the downloaded ZIP.") from None
 
 
 def clone(api, name, path=None):

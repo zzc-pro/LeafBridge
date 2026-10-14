@@ -1,6 +1,6 @@
 # LeafBridge
 
-A small command-line tool for exchanging files between local Git repositories and Overleaf. Login, project listing, cloning, and associating existing repositories are implemented. Push and pull synchronization is still under development.
+A small command-line tool for exchanging files between local Git repositories and Overleaf. Login, project listing, cloning, associating existing repositories, and inspecting file differences are implemented. Push and pull synchronization is still under development.
 
 ## Install with Conda
 
@@ -122,6 +122,39 @@ The command saves `base_url`, `project_id`, and `name` in `.leafbridge/config.js
 Adding the same project again preserves the existing configuration and synchronization state. Adding a different project fails without replacing the association. Invalid or incomplete existing metadata must be checked before retrying. A failed project lookup does not create an association.
 
 The empty baseline represents a repository that has not yet synchronized. Future synchronization must treat differing local and remote versions of the same file as a first-sync conflict. `leaf remote add` provides the association workflow previously planned as `leaf init`; there is no separate `leaf init` command.
+
+## Inspect file differences
+
+Run inside an associated or cloned Git working tree, including its subdirectories:
+
+~~~powershell
+leaf status
+~~~
+
+The command uses the saved login session to download the current source ZIP into memory. It hashes remote files without extracting them and compares them with local SHA-256 fingerprints and the last successful synchronization baseline. It does not open a browser, change source files, update the baseline, or upload anything.
+
+Only differences appear in the file table; matching files are counted in the summary. Paths are quoted and control characters are escaped:
+
+~~~text
+STATUS            FILE
+local only        "notes/local.txt"
+remote modified   "sections/introduction.tex"
+conflict          "main.tex"
+~~~
+
+| Status | Meaning |
+| --- | --- |
+| `local only` / `remote only` | A file without a baseline exists on only one side. |
+| `local modified` / `remote modified` | Both sides contain the file; only the indicated side differs from the baseline. |
+| `conflict` | Both sides changed differently, or their contents differ on first sync. Also includes a missing file on one side when the other side changed. |
+| `missing local` / `missing remote` | A previously synchronized file is absent on the indicated side; the other side still matches the baseline. |
+| `missing both` | A baseline file is now absent on both sides. |
+
+Equal content is counted as `same`, even when it differs from the saved baseline. Inspection leaves that baseline unchanged. Missing files are reported for review; deletion is not propagated.
+
+Selection follows system Git: tracked files are included even if ignored, and untracked files are included only when not ignored. Git ignore rules also filter remote-only and baseline-only paths unless they are locally tracked. `.git` and `.leafbridge` metadata are excluded from local source selection; reserved remote ZIP paths, unsafe local paths, unsupported source directories, and invalid metadata produce errors.
+
+A completed inspection returns exit code 0, including when conflicts are found. Failed inspections return 1; cancellation returns 130. A request failure never produces a partial success table. Push and pull are not yet implemented.
 
 ## Session storage
 

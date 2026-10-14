@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 
-from . import git
+from . import git, sync
 from .client import BASE_URL, OverleafError, OverleafClient
 from .sync import clone
 
@@ -67,6 +67,39 @@ def add(api, name=None, project_id=None, path=None):
     return root, project, True
 
 
+def _read(root, filename):
+    """Read repository metadata only from regular files inside the metadata directory."""
+    try:
+        metadata = root / ".leafbridge"
+        target = metadata / filename
+        if (metadata.is_symlink() or metadata.resolve().parent != root
+                or target.is_symlink() or target.resolve().parent != metadata.resolve()):
+            raise OverleafError("LeafBridge metadata contains an unsafe path.")
+        if not target.is_file():
+            raise OverleafError(f"Missing .leafbridge/{filename}. Run leaf remote add or leaf clone first.")
+        data = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError
+        return data
+    except (OSError, ValueError, UnicodeError):
+        raise OverleafError(f"Unable to read .leafbridge/{filename}. Check its format and permissions.") from None
+
+
+def status(api, path=None):
+    """Load the association and baseline, then inspect current local and remote contents."""
+    root = git.root(path)
+    config = _read(root, "config.json")
+    state = _read(root, "state.json")
+    if (config.get("base_url") != BASE_URL or not isinstance(config.get("project_id"), str)
+            or not config["project_id"].strip()
+            or ("name" in config and not isinstance(config["name"], str))):
+        raise OverleafError("Invalid project configuration. Check .leafbridge/config.json.")
+    if type(state.get("version")) is not int or state["version"] != 1 or "files" not in state:
+        raise OverleafError("Unsupported synchronization baseline. Check .leafbridge/state.json.")
+    rows = sync.status(api, root, config["project_id"], state["files"])
+    return root, config, rows
+
+
 def main(argv=None):
     """Parse CLI arguments, run the requested operation, and return its exit code."""
     parser = argparse.ArgumentParser(prog="leaf", description="Bridge local Git repositories and Overleaf.")
@@ -77,6 +110,7 @@ def main(argv=None):
     login.add_argument("--timeout", type=_timeout, default=300,
                        help="Seconds to wait for login (default: 300).")
     commands.add_parser("list", help="List active account projects, excluding archived and trashed projects.")
+    commands.add_parser("status", help="Compare local and remote files without modifying files or synchronization state.")
     clone_command = commands.add_parser("clone", help="Clone an active Overleaf project into a local Git repository.")
     clone_command.add_argument("name", help="Exact project name; always wrap it in double quotes.")
     clone_command.add_argument("directory", nargs="?", help="Local directory (default: the project name).")
@@ -89,8 +123,24 @@ def main(argv=None):
     if args.command == "remote" and ((args.name is None) == (args.project_id is None)
                                       or not (args.name or args.project_id)):
         add_command.error("specify an exact project name or --id, but not both")
-    operation = {"login": "Login", "list": "Listing projects", "clone": "Clone", "remote": "Remote add"}[args.command]
+    operation = {"login": "Login", "list": "Listing projects", "clone": "Clone", "remote": "Remote add", "status": "Status"}[args.command]
     try:
+        if args.command == "status":
+            root, config, rows = status(OverleafClient())
+            name = " ".join(config.get("name", config["project_id"]).split())
+            print(f"Project: {name} ({config['project_id']})")
+            print(f"Local repository: {root}")
+            changes = {name: value for name, value in rows.items() if value != "same"}
+            if changes:
+                print(f"{'STATUS':<16}  FILE")
+                for name, value in changes.items():
+                    print(f"{value:<16}  {json.dumps(name, ensure_ascii=False)}")
+            else:
+                print("No file differences found.")
+            conflicts = sum(value == "conflict" for value in rows.values())
+            print(f"Files: {len(rows)}; same: {len(rows) - len(changes)}; differences: {len(changes)}; conflicts: {conflicts}")
+            print("Inspection only. No files or synchronization state were changed; deletions are not propagated.")
+            return 0
         if args.command == "remote":
             path, project, created = add(OverleafClient(), args.name, args.project_id)
             message = "Project associated" if created else "Project already associated"
@@ -108,9 +158,9 @@ def main(argv=None):
                 return 0
             print(f"{'ID':<24}  {'STATUS':<8}  NAME")
             for project in projects:
-                status = "trashed" if project.get("trashed") else "archived" if project.get("archived") else "active"
+                label = "trashed" if project.get("trashed") else "archived" if project.get("archived") else "active"
                 name = " ".join(project["name"].split())
-                print(f"{project['id']:<24}  {status:<8}  {name}")
+                print(f"{project['id']:<24}  {label:<8}  {name}")
             print(f"Projects: {len(projects)}")
             return 0
         print("Opening Overleaf in a new browser window. Complete login on the website, including CAPTCHA or SSO.", flush=True)
