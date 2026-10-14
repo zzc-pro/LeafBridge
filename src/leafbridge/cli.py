@@ -85,8 +85,8 @@ def _read(root, filename):
         raise OverleafError(f"Unable to read .leafbridge/{filename}. Check its format and permissions.") from None
 
 
-def status(api, path=None):
-    """Load the association and baseline, then inspect current local and remote contents."""
+def _load(path=None):
+    """Load and validate the working tree association and synchronization state."""
     root = git.root(path)
     config = _read(root, "config.json")
     state = _read(root, "state.json")
@@ -96,8 +96,27 @@ def status(api, path=None):
         raise OverleafError("Invalid project configuration. Check .leafbridge/config.json.")
     if type(state.get("version")) is not int or state["version"] != 1 or "files" not in state:
         raise OverleafError("Unsupported synchronization baseline. Check .leafbridge/state.json.")
-    rows = sync.status(api, root, config["project_id"], state["files"])
+    return root, config, state["files"]
+
+
+def status(api, path=None):
+    """Load the association and baseline, then inspect current local and remote contents."""
+    root, config, files = _load(path)
+    rows = sync.status(api, root, config["project_id"], files)
     return root, config, rows
+
+
+def transfer(api, direction, force=False, path=None):
+    """Run a manual push or pull and print completed files and skipped differences."""
+    root, config, files = _load(path)
+    count, skipped = sync.run(api, root, config["project_id"], files, direction, force,
+                              report=lambda action, name: print(f"{action}: {json.dumps(name, ensure_ascii=False)}", flush=True))
+    for name, label in skipped.items():
+        print(f"Skipped ({label}): {json.dumps(name, ensure_ascii=False)}")
+    print(f"{direction.capitalize()} complete. Transferred: {count}; skipped differences: {len(skipped)}.")
+    if skipped:
+        print("Skipped files were preserved. Source deletions are not propagated; other changes may need the opposite direction.")
+    return 0
 
 
 def main(argv=None):
@@ -111,6 +130,10 @@ def main(argv=None):
                        help="Seconds to wait for login (default: 300).")
     commands.add_parser("list", help="List active account projects, excluding archived and trashed projects.")
     commands.add_parser("status", help="Compare local and remote files without modifying files or synchronization state.")
+    for direction in ["push", "pull"]:
+        command = commands.add_parser(direction, help="Upload local changes to Overleaf." if direction == "push"
+                                      else "Download Overleaf changes to the local repository.")
+        command.add_argument("--force", action="store_true", help="Prefer source contents for differing files; never propagate deletions.")
     clone_command = commands.add_parser("clone", help="Clone an active Overleaf project into a local Git repository.")
     clone_command.add_argument("name", help="Exact project name; always wrap it in double quotes.")
     clone_command.add_argument("directory", nargs="?", help="Local directory (default: the project name).")
@@ -123,8 +146,11 @@ def main(argv=None):
     if args.command == "remote" and ((args.name is None) == (args.project_id is None)
                                       or not (args.name or args.project_id)):
         add_command.error("specify an exact project name or --id, but not both")
-    operation = {"login": "Login", "list": "Listing projects", "clone": "Clone", "remote": "Remote add", "status": "Status"}[args.command]
+    operation = {"login": "Login", "list": "Listing projects", "clone": "Clone", "remote": "Remote add",
+                 "status": "Status", "push": "Push", "pull": "Pull"}[args.command]
     try:
+        if args.command in {"push", "pull"}:
+            return transfer(OverleafClient(), args.command, args.force)
         if args.command == "status":
             root, config, rows = status(OverleafClient())
             name = " ".join(config.get("name", config["project_id"]).split())

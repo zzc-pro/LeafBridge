@@ -46,15 +46,12 @@ def ignore(path):
 
 
 def files(path):
-    """Return tracked and untracked nonignored paths using Git's own selection rules."""
+    """List tracked and untracked candidate paths using Git, before final ignore filtering."""
     try:
         result = subprocess.run([check(), "-C", str(path), "ls-files", "--cached", "--others",
                                  "--exclude-standard", "-z"], check=True,
                                 capture_output=True, timeout=30)
-        tracked = subprocess.run([check(), "-C", str(path), "ls-files", "--cached", "-z"],
-                                 check=True, capture_output=True, timeout=30)
-        return ({name for name in result.stdout.decode("utf-8").split("\0") if name},
-                {name for name in tracked.stdout.decode("utf-8").split("\0") if name})
+        return {name for name in result.stdout.decode("utf-8").split("\0") if name}
     except (OSError, UnicodeError, subprocess.SubprocessError):
         raise OverleafError("Unable to list local Git files. Check Git and repository permissions.") from None
 

@@ -4,7 +4,7 @@ import json
 import math
 import os
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sys
 import tempfile
 import time
@@ -70,6 +70,27 @@ def _playwright():
     return sync_playwright, Error
 
 
+def _frames(text):
+    """Decode single or length-prefixed Socket.IO packets using JavaScript string lengths."""
+    if not text.startswith("\ufffd"):
+        return [text]
+    frames = []
+    try:
+        while text:
+            if not text.startswith("\ufffd"):
+                raise ValueError
+            length, body = text[1:].split("\ufffd", 1)
+            size = int(length) * 2
+            data = body.encode("utf-16-le")
+            if size <= 0 or size > len(data):
+                raise ValueError
+            frames.append(data[:size].decode("utf-16-le"))
+            text = data[size:].decode("utf-16-le")
+    except (ValueError, UnicodeError):
+        raise OverleafError("Unexpected project metadata packet. Check Overleaf API compatibility.") from None
+    return frames
+
+
 def _browser_path(channel):
     """Find an installed browser instead of relying only on Playwright's default paths."""
     if channel == "chromium":
@@ -109,6 +130,7 @@ class OverleafClient:
     def __init__(self, session_path=None):
         """Use the default user session file unless a custom path is provided."""
         self.session_path = Path(session_path) if session_path is not None else session_file()
+        self._roots = {}
 
     def load(self):
         """Read and validate the session; the server may revoke cookies before expiry."""
@@ -244,6 +266,114 @@ class OverleafClient:
                         pass
         except request_error:
             raise OverleafError("Unable to download the project. Check your connection and try again.") from None
+
+    def _root(self, request, project_id):
+        """Read and cache the project root folder ID through a short-lived HTTP polling connection."""
+        if project_id in self._roots:
+            return self._roots[project_id]
+        handshake = request.get("/socket.io/1/", params={"projectId": project_id},
+                                max_redirects=0, timeout=30_000)
+        if handshake.status != 200:
+            raise OverleafError(f"Unable to read upload folder metadata (HTTP {handshake.status}). Check login and project access.")
+        parts = handshake.text().split(":")
+        if len(parts) != 4 or not parts[0] or "xhr-polling" not in parts[3].split(","):
+            raise OverleafError("Overleaf did not provide a supported project metadata connection.")
+        route = "/socket.io/1/xhr-polling/" + quote(parts[0], safe="")
+        deadline = time.monotonic() + 30
+        try:
+            for _ in range(6):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                response = request.get(route, max_redirects=0, timeout=min(15_000, max(1, int(remaining * 1000))))
+                if response.status != 200:
+                    raise OverleafError(f"Unable to read upload folder metadata (HTTP {response.status}).")
+                for frame in _frames(response.text()):
+                    if frame.startswith(("0:", "7:")):
+                        raise OverleafError("Overleaf rejected the project metadata connection. Check login and project access.")
+                    if frame.startswith("2:"):
+                        request.post(route, data="2::", headers={"Content-Type": "text/plain"},
+                                     max_redirects=0, timeout=5_000)
+                    if not frame.startswith("5:::"):
+                        continue
+                    try:
+                        event = json.loads(frame[4:])
+                    except ValueError:
+                        raise OverleafError("Unexpected project metadata JSON.") from None
+                    if not isinstance(event, dict):
+                        raise OverleafError("Unexpected project metadata event.")
+                    if event.get("name") == "connectionRejected":
+                        raise OverleafError("Overleaf denied project metadata access. Check login and project access.")
+                    if event.get("name") != "joinProjectResponse":
+                        continue
+                    args = event.get("args")
+                    project = args[0].get("project") if isinstance(args, list) and args and isinstance(args[0], dict) else None
+                    folders = project.get("rootFolder") if isinstance(project, dict) else None
+                    if (not isinstance(project, dict) or project.get("_id") != project_id
+                            or not isinstance(folders, list) or len(folders) != 1 or not isinstance(folders[0], dict)
+                            or not isinstance(folders[0].get("_id"), str) or not folders[0]["_id"]):
+                        raise OverleafError("Unexpected project root folder metadata.")
+                    self._roots[project_id] = folders[0]["_id"]
+                    return self._roots[project_id]
+            raise OverleafError("Timed out reading the project root folder. Check Overleaf connectivity.")
+        finally:
+            try:
+                request.post(route, data="0::", headers={"Content-Type": "text/plain"},
+                             max_redirects=0, timeout=5_000)
+            except Exception:
+                # Closing the transient read connection must not hide the original result.
+                pass
+
+    def upload(self, project_id, name, data):
+        """Upload or replace one source file, preserving its relative folder path."""
+        path = PurePosixPath(name)
+        if (not name or path.is_absolute() or path.as_posix() != name or "\\" in name
+                or any(part in {".", ".."} or ":" in part or "\x00" in part for part in name.split("/"))
+                or any(part.startswith(".") for part in path.parts)):
+            raise OverleafError("Cannot upload a hidden, unsafe, or reserved source path.")
+        session = self.load()
+        sync_playwright, request_error = _playwright()
+        try:
+            with sync_playwright() as playwright:
+                request = playwright.request.new_context(
+                    base_url=BASE_URL,
+                    storage_state={"cookies": session["cookies"], "origins": []},
+                    extra_http_headers={"X-CSRF-Token": session["csrf"], "Origin": BASE_URL,
+                                        "Referer": BASE_URL + "/project", "Accept": "application/json"},
+                    timeout=60_000,
+                )
+                try:
+                    folder_id = self._root(request, project_id)
+                    payload = {"name": path.name, "relativePath": name,
+                               "qqfile": {"name": path.name, "mimeType": "application/octet-stream", "buffer": data}}
+                    for prefix in ("project", "Project"):
+                        response = request.post(f"/{prefix}/{quote(project_id, safe='')}/upload",
+                                                params={"folder_id": folder_id}, max_redirects=0, multipart=payload)
+                        if response.status != 404:
+                            break
+                    if response.status == 401 or 300 <= response.status < 400:
+                        raise LoginError("Session is no longer authenticated. Run leaf login again.")
+                    if response.status == 403:
+                        raise OverleafError("Overleaf denied the upload. Check write access or run leaf login again.")
+                    if response.status == 429:
+                        raise OverleafError("Overleaf rate limit reached. Try again later.")
+                    if response.status == 404:
+                        raise OverleafError("File upload failed (HTTP 404) on both supported upload routes. Check project access or API compatibility.")
+                    if response.status != 200:
+                        raise OverleafError(f"File upload failed (HTTP {response.status}).")
+                    try:
+                        result = response.json()
+                    except ValueError:
+                        raise OverleafError("Overleaf did not return upload JSON. Check login or API compatibility.") from None
+                    if not isinstance(result, dict) or result.get("success") is not True:
+                        raise OverleafError("Overleaf did not confirm the file upload. Check file limits or API compatibility.")
+                finally:
+                    try:
+                        request.dispose()
+                    except request_error:
+                        pass
+        except request_error:
+            raise OverleafError("Unable to upload the file. Check your connection and try again.") from None
 
     def login(self, browser="chrome", timeout=300):
         """Open a new Chrome window by default, wait for login, and save session cookies."""

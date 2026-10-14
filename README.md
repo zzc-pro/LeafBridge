@@ -1,6 +1,6 @@
 # LeafBridge
 
-A small command-line tool for exchanging files between local Git repositories and Overleaf. Login, project listing, cloning, associating existing repositories, and inspecting file differences are implemented. Push and pull synchronization is still under development.
+A small command-line tool for exchanging files between local Git repositories and Overleaf. Login, project listing, cloning, associating existing repositories, inspecting file differences, and manual push/pull synchronization are implemented. Git manages local history; LeafBridge exchanges working-tree files with Overleaf.
 
 ## Install with Conda
 
@@ -152,9 +152,53 @@ conflict          "main.tex"
 
 Equal content is counted as `same`, even when it differs from the saved baseline. Inspection leaves that baseline unchanged. Missing files are reported for review; deletion is not propagated.
 
-Selection follows system Git: tracked files are included even if ignored, and untracked files are included only when not ignored. Git ignore rules also filter remote-only and baseline-only paths unless they are locally tracked. `.git` and `.leafbridge` metadata are excluded from local source selection; reserved remote ZIP paths, unsafe local paths, unsupported source directories, and invalid metadata produce errors.
+Selection starts with system Git's tracked and untracked file list, then applies Git's ignore rules to every candidate, including already tracked files, remote-only files, and baseline-only paths. Matching files are excluded. Any path with a dot-prefixed file or directory component is also excluded: `.gitignore`, `.env`, `.notes/main.tex`, and `sections/.draft.tex` are examples. Hidden and ignored files are not counted, transferred, or treated as conflicts. These rules apply to status, push, pull, and force. Reserved remote ZIP paths, unsafe local paths, unsupported source directories, and invalid metadata produce errors.
 
-A completed inspection returns exit code 0, including when conflicts are found. Failed inspections return 1; cancellation returns 130. A request failure never produces a partial success table. Push and pull are not yet implemented.
+A completed inspection returns exit code 0, including when conflicts are found. Failed inspections return 1; cancellation returns 130. A request failure never produces a partial success table.
+
+## Push and pull
+
+Run these commands inside your associated Git working tree or any subdirectory:
+
+~~~powershell
+leaf push
+leaf pull
+~~~
+
+`leaf push` uploads local additions and modifications. `leaf pull` downloads remote additions and modifications. They use the saved login session without opening a browser. Files do not need to be committed; Git remains responsible for your local history, and LeafBridge never stages files or creates commits.
+
+Each command first compares all selected files against the synchronization baseline. If any conflicts exist, the entire ordinary synchronization stops before changing files or state, lists the conflicting paths, and returns exit code 1:
+
+~~~text
+Push failed: Conflicts detected. Synchronization paused; no files or state were changed.
+  "main.tex"
+Resolve conflicts or use leaf push --force to prefer the source side.
+~~~
+
+Choose the source explicitly when you want to overwrite differing destination contents:
+
+~~~powershell
+leaf push --force
+leaf pull --force
+~~~
+
+`push --force` prefers local files; `pull --force` prefers remote files. Force transfers every selected source file whose content differs from the destination, including conflicts and changes made only at the destination. Identical files are not transferred. Git exclusions still apply.
+
+Ordinary commands transfer only source additions or modifications. Changes made only on the opposite side are preserved and listed as skipped; use the opposite command to synchronize them. If the destination deleted a file while its source still matches the baseline, ordinary synchronization preserves that difference; force can restore the file from the source.
+
+No command propagates deletions, even with force. Destination-only files are preserved and listed as skipped. A source file missing during a deletion-versus-edit conflict is also preserved at the destination by force. File-to-folder or folder-to-file replacement requires deletion and is rejected before transfer. Resolve such paths manually.
+
+Nested folders and binary files are supported. Every confirmed file transfer is followed by an atomic baseline save; equal content also updates the baseline without transfer. A failed transfer stops the operation, identifies the file, and retains already completed files and their saved fingerprints. Failed files retain their previous fingerprints. If a file transfers but its state cannot be saved, the command reports that explicitly; run `leaf status` before retrying. Synchronization is not an all-or-nothing transaction after transmission begins.
+
+Pull replaces each local file atomically and refuses to overwrite local changes made since its initial snapshot. `.gitignore` is a local configuration file and is neither uploaded nor downloaded. Selection uses the local Git ignore rules at the start of the command, including nested `.gitignore` files and other standard Git exclusions. Add LaTeX build outputs such as `*.aux`, `*.log`, and `main.pdf` to your repository's `.gitignore` to exclude them; LeafBridge does not guess which ordinary files are build outputs. Already tracked ignored files are also excluded, and force never bypasses exclusions.
+
+Successful commands return 0 and summarize transfers and skipped differences. Failed commands return 1; cancellation returns 130. Review any skipped paths, since completion does not mean that every file is identical.
+
+Uploads use the website's lowercase `POST /project/:Project_id/upload` multipart endpoint with saved cookies and CSRF, the `qqfile` file field, `relativePath` for nested paths, and the project root folder ID as the `folder_id` query parameter. Without `folder_id`, the relative-path folder lookup can return 404 even on the correct route. Only HTTP 404 triggers a fallback to `/Project/:Project_id/upload` for older deployments; other errors and network failures are not retried. The server creates missing folders and replaces same-named entities. HTTP errors, login redirects, malformed responses, and `success: false` are failures. Interface references: [Overleaf upload routes](https://github.com/overleaf/overleaf/blob/main/services/web/app/src/Features/Uploads/UploadsRouter.mjs), [upload controller](https://github.com/overleaf/overleaf/blob/main/services/web/app/src/Features/Uploads/ProjectUploadController.mjs), and [file import implementation](https://github.com/overleaf/overleaf/blob/main/services/web/app/src/Features/Uploads/FileSystemImportManager.mjs). Public Overleaf's deployed route casing was checked against its editor frontend; it can differ from the open-source router.
+
+Before the first upload, the client reads the root folder ID from the website's automatic `joinProjectResponse` through a short-lived Socket.IO HTTP polling connection. It closes the connection and caches only the root folder ID for that command. This uses existing authenticated HTTP requests, adds no browser window or dependency, verifies that the metadata belongs to the requested project, and refuses uploads if the folder lookup fails. Protocol references: [Overleaf real-time router](https://github.com/overleaf/overleaf/blob/main/services/real-time/app/js/Router.js) and [project folder locator](https://github.com/overleaf/overleaf/blob/main/services/web/app/src/Features/Project/ProjectLocator.mjs).
+
+The comparison uses a downloaded snapshot, and the upload endpoint does not provide conditional writes. Avoid simultaneous edits in Overleaf while pushing. Overleaf can normalize editable text encodings and line endings during import; fingerprints compare exact bytes, so these conversions can appear as subsequent remote differences. UTF-8 files with LF line endings avoid the common newline conversion.
 
 ## Session storage
 

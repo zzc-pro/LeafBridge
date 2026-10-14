@@ -87,7 +87,7 @@ class StatusTests(unittest.TestCase):
                     "sections/local.tex": "local only", "sections/remote.tex": "remote only",
                     "local.tex": "local modified", "remote.tex": "remote modified",
                     "missing-local.tex": "missing local", "missing-remote.tex": "missing remote",
-                    "missing-both.tex": "missing both", ".gitignore": "local only"}
+                    "missing-both.tex": "missing both"}
         self.assertEqual(rows, expected)
         self.assertEqual(before, {path.relative_to(self.root): path.read_bytes()
                                   for path in self.root.rglob("*") if path.is_file()})
@@ -95,7 +95,7 @@ class StatusTests(unittest.TestCase):
         self.api.login.assert_not_called()
 
     def test_selection(self):
-        """Honor nested ignores, tracked ignored files, remote-only ignores, and unusual names."""
+        """Exclude tracked and untracked ignored files while honoring nested exceptions and Unicode."""
         self.write(".gitignore", b"*.aux\n/.leafbridge/\n")
         self.write("tracked.aux", b"tracked")
         subprocess.run([git.check(), "-C", str(self.root), "add", "-f", "tracked.aux"],
@@ -109,20 +109,20 @@ class StatusTests(unittest.TestCase):
                                                   "sections/remote.tex": b"ignored", "sections/keep.tex": b"kept",
                                                   "a space 中文.tex": b"unicode"})
         rows = cli.status(self.api, self.root)[2]
-        self.assertEqual(rows["tracked.aux"], "same")
+        self.assertNotIn("tracked.aux", rows)
         self.assertEqual(rows["sections/keep.tex"], "same")
         self.assertEqual(rows["a space 中文.tex"], "same")
         for name in ["local.aux", "remote.aux", "sections/hidden.tex", "sections/remote.tex", ".leafbridge/config.json"]:
             self.assertNotIn(name, rows)
 
     def test_clone(self):
-        """Compare cloned files with their original ZIP baseline, including the ignore edit."""
+        """Compare cloned source files while excluding the local hidden ignore file."""
         target = self.root / "cloned"
         self.api.projects.return_value = [{"id": "project-id", "name": "My Paper"}]
         self.api.download.return_value = archive({"main.tex": b"source", ".gitignore": b"*.aux"})
         sync.clone(self.api, "My Paper", target)
         rows = cli.status(self.api, target)[2]
-        self.assertEqual(rows, {"main.tex": "same", ".gitignore": "local modified"})
+        self.assertEqual(rows, {"main.tex": "same"})
 
     def test_metadata(self):
         """Fail before network access when metadata is missing, malformed, or unsupported."""

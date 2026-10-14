@@ -28,6 +28,11 @@ def _path(name):
     return PurePosixPath(name)
 
 
+def _hidden(name):
+    """Exclude any path with a dot-prefixed file or directory component from synchronization."""
+    return any(part.startswith(".") for part in PurePosixPath(name).parts)
+
+
 def _unpack(data, root=None):
     """Hash safe ZIP entries and optionally extract them within a target directory."""
     hashes, seen = {}, set()
@@ -80,8 +85,31 @@ def compare(local, remote, base):
     return "local modified" if local != base else "remote modified"
 
 
-def status(api, root, project_id, base):
-    """Compare selected local files and the remote ZIP without changing files or baseline."""
+def _target(root, name):
+    """Resolve a source path inside the working tree without following file or folder links."""
+    path = root
+    for part in _path(name).parts:
+        path = path / part
+        if path.is_symlink() or path.resolve() != path or not path.resolve().is_relative_to(root):
+            raise OverleafError(f"Local source path is a link or escapes the repository: {name!r}")
+    return path
+
+
+def _hash(path):
+    """Hash a regular local file, returning None when the file is absent."""
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise OverleafError(f"Local source path is not a regular file: {path.name!r}")
+    with path.open("rb") as stream:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _scan(api, root, project_id, base):
+    """Read local and remote snapshots and classify all selected files before any writes."""
     try:
         if not isinstance(base, dict):
             raise OverleafError("Invalid synchronization baseline. Check .leafbridge/state.json.")
@@ -90,32 +118,154 @@ def status(api, root, project_id, base):
                     or not isinstance(digest, str) or len(digest) != 64
                     or any(char not in "0123456789abcdef" for char in digest)):
                 raise OverleafError("Invalid synchronization baseline. Check .leafbridge/state.json.")
-        selected, tracked = git.files(root)
-        # Metadata is never a source file, even if it was accidentally tracked.
-        selected = {name for name in selected if PurePosixPath(name).parts[0].casefold() not in {".git", ".leafbridge"}}
+        selected = {name for name in git.files(root) if not _hidden(name)}
+        # Git's no-index ignore check also excludes files that were already tracked.
+        selected -= git.ignored(root, selected)
         local = {}
         for name in sorted(selected):
-            relative = _path(name)
-            path = root.joinpath(*relative.parts)
-            if path.is_symlink() or not path.resolve().is_relative_to(root):
-                raise OverleafError(f"Local source path is a link or escapes the repository: {name!r}")
-            if not path.exists():
-                continue
-            if not path.is_file():
-                raise OverleafError(f"Local source path is not a regular file: {name!r}")
-            with path.open("rb") as stream:
-                digest = hashlib.sha256()
-                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(chunk)
-                local[name] = digest.hexdigest()
-        remote = _unpack(api.download(project_id))
-        names = selected | remote.keys() | base.keys()
-        names -= git.ignored(root, names - tracked)
-        return {name: compare(local.get(name), remote.get(name), base.get(name)) for name in sorted(names)}
+            digest = _hash(_target(root, name))
+            if digest is not None:
+                local[name] = digest
+        data = api.download(project_id)
+        remote = _unpack(data)
+        names = {name for name in selected | remote.keys() | base.keys() if not _hidden(name)}
+        names -= git.ignored(root, names)
+        rows = {name: compare(local.get(name), remote.get(name), base.get(name)) for name in sorted(names)}
+        present = (local.keys() | remote.keys()) & names
+        seen = {}
+        for name in present:
+            key = os.path.normcase(name)
+            if key in seen and seen[key] != name:
+                raise OverleafError(f"Source paths differ only in case: {seen[key]!r} and {name!r}. Rename them before synchronization.")
+            seen[key] = name
+            for parent in PurePosixPath(name).parents:
+                if parent.as_posix() in present:
+                    rows[name] = rows[parent.as_posix()] = "conflict"
+        return local, remote, rows, data
     except OverleafError:
         raise
     except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error):
         raise OverleafError("Unable to compare project files. Check local permissions and the downloaded ZIP.") from None
+
+
+def status(api, root, project_id, base):
+    """Compare selected local files and the remote ZIP without changing files or baseline."""
+    return _scan(api, root, project_id, base)[2]
+
+
+def _save(root, files):
+    """Atomically persist successful per-file fingerprints, preserving old state on failure."""
+    metadata = root / ".leafbridge"
+    target = metadata / "state.json"
+    temporary = None
+    try:
+        if (metadata.is_symlink() or metadata.resolve() != metadata or target.is_symlink()
+                or target.resolve().parent != metadata or not target.is_file()):
+            raise OverleafError("Cannot save synchronization state through an unsafe or missing metadata path.")
+        descriptor, name = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=metadata)
+        temporary = Path(name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump({"version": 1, "files": files}, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except OSError:
+        raise OverleafError("Unable to save synchronization state. A file may already have transferred; run leaf status before retrying.") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _write(root, name, data, expected):
+    """Replace one local file atomically after checking it still matches the inspected version."""
+    target = _target(root, name)
+    temporary = None
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, path = tempfile.mkstemp(prefix=".leafbridge-file-", dir=target.parent)
+        temporary = Path(path)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        target = _target(root, name)
+        if _hash(target) != expected:
+            raise OverleafError(f"Local file changed during synchronization: {name!r}. Run leaf status and retry.")
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def run(api, root, project_id, base, direction, force=False, report=None):
+    """Sync one direction, stopping before all writes on conflicts unless force is explicit."""
+    if direction not in {"push", "pull"}:
+        raise OverleafError("Synchronization direction must be push or pull.")
+    local, remote, rows, data = _scan(api, root, project_id, base)
+    conflicts = [name for name, label in rows.items() if label == "conflict"]
+    if conflicts and not force:
+        paths = "\n".join("  " + json.dumps(name, ensure_ascii=False) for name in conflicts)
+        raise OverleafError(f"Conflicts detected. Synchronization paused; no files or state were changed.\n{paths}\n"
+                            f"Resolve conflicts or use leaf {direction} --force to prefer the source side.")
+    source, destination = (local, remote) if direction == "push" else (remote, local)
+    labels = {"local only", "local modified"} if direction == "push" else {"remote only", "remote modified"}
+    changes = [name for name, label in rows.items() if name in source and source.get(name) != destination.get(name)
+               and (force or label in labels)]
+    skipped = {name: label for name, label in rows.items() if label != "same" and name not in changes}
+    # Validate every destination before touching any file, including structural conflicts.
+    try:
+        for name in changes:
+            if direction == "pull":
+                target = _target(root, name)
+                for parent in target.parents:
+                    if parent == root:
+                        break
+                    if parent.exists() and not parent.is_dir():
+                        raise OverleafError(f"Cannot replace a file with a folder without deletion: {name!r}")
+                if target.exists() and not target.is_file():
+                    raise OverleafError(f"Cannot replace a folder with a file without deletion: {name!r}")
+            else:
+                path = PurePosixPath(name)
+                if (any(parent.as_posix() in remote for parent in path.parents)
+                        or any(other.startswith(name + "/") for other in remote)):
+                    raise OverleafError(f"Cannot replace a remote file or folder without deletion: {name!r}")
+    except (OSError, RuntimeError) as error:
+        if isinstance(error, OverleafError):
+            raise
+        raise OverleafError("Unable to validate synchronization paths. No files or state were changed.") from None
+    saved = dict(base)
+    transferred = 0
+    name = None
+    try:
+        for name in changes:
+            if direction == "push":
+                target = _target(root, name)
+                content = target.read_bytes()
+                if hashlib.sha256(content).hexdigest() != local[name]:
+                    raise OverleafError(f"Local file changed during synchronization: {name!r}. Run leaf status and retry.")
+                api.upload(project_id, name, content)
+            else:
+                with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                    entry = next(entry for entry in archive.infolist() if not entry.is_dir()
+                                 and PurePosixPath(entry.filename).as_posix() == name)
+                    content = archive.read(entry)
+                _write(root, name, content, local.get(name))
+            updated = {**saved, name: source[name]}
+            _save(root, updated)
+            saved = updated
+            transferred += 1
+            if report is not None:
+                report("Uploaded" if direction == "push" else "Downloaded", name)
+        for name, label in rows.items():
+            if label == "same" and saved.get(name) != local[name]:
+                saved[name] = local[name]
+                _save(root, saved)
+    except (OverleafError, OSError, ValueError, zipfile.BadZipFile, RuntimeError, zlib.error) as error:
+        reason = str(error) if isinstance(error, OverleafError) else "Check file permissions and downloaded contents."
+        failed = f" File: {json.dumps(name, ensure_ascii=False)}." if name is not None else ""
+        raise OverleafError(f"Synchronization stopped after {transferred} completed file transfer(s).{failed} {reason}") from None
+    return transferred, skipped
 
 
 def clone(api, name, path=None):
