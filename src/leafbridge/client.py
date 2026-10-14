@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 BASE_URL = "https://www.overleaf.com"
 SESSION_COOKIES = {"overleaf_session2", "sharelatex.sid"}
@@ -213,6 +213,37 @@ class OverleafClient:
                         pass
         except request_error:
             raise OverleafError("Unable to query Overleaf. Check your connection and try again.") from None
+
+    def download(self, project_id):
+        """Download a project's source ZIP using the saved login session."""
+        session = self.load()
+        sync_playwright, request_error = _playwright()
+        try:
+            with sync_playwright() as playwright:
+                request = playwright.request.new_context(
+                    base_url=BASE_URL,
+                    storage_state={"cookies": session["cookies"], "origins": []},
+                    extra_http_headers={"Accept": "application/zip", "Referer": BASE_URL + "/project"},
+                    timeout=60_000,
+                )
+                try:
+                    response = request.get(f"/Project/{quote(project_id, safe='')}/download/zip", max_redirects=0)
+                    if response.status == 401 or 300 <= response.status < 400:
+                        raise LoginError("Session is no longer authenticated. Run leaf login again.")
+                    if response.status == 403:
+                        raise OverleafError("Overleaf denied the download. Check project access or run leaf login again.")
+                    if response.status == 429:
+                        raise OverleafError("Overleaf rate limit reached. Try again later.")
+                    if response.status != 200:
+                        raise OverleafError(f"Project download failed (HTTP {response.status}).")
+                    return response.body()
+                finally:
+                    try:
+                        request.dispose()
+                    except request_error:
+                        pass
+        except request_error:
+            raise OverleafError("Unable to download the project. Check your connection and try again.") from None
 
     def login(self, browser="chrome", timeout=300):
         """Open a new Chrome window by default, wait for login, and save session cookies."""

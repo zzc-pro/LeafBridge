@@ -5,6 +5,7 @@ import math
 import sys
 
 from .client import OverleafError, OverleafClient
+from .sync import clone
 
 
 def _timeout(value):
@@ -28,8 +29,16 @@ def main(argv=None):
     login.add_argument("--timeout", type=_timeout, default=300,
                        help="Seconds to wait for login (default: 300).")
     commands.add_parser("list", help="List active account projects, excluding archived and trashed projects.")
+    clone_command = commands.add_parser("clone", help="Clone an active Overleaf project into a local Git repository.")
+    clone_command.add_argument("name", help="Exact project name; always wrap it in double quotes.")
+    clone_command.add_argument("directory", nargs="?", help="Local directory (default: the project name).")
     args = parser.parse_args(argv)
     try:
+        if args.command == "clone":
+            print(f"Cloning {args.name!r}...", flush=True)
+            path = clone(OverleafClient(), args.name, args.directory)
+            print(f"Project cloned to: {path}")
+            return 0
         if args.command == "list":
             projects = OverleafClient().projects()
             if not projects:
@@ -45,11 +54,11 @@ def main(argv=None):
         print("Opening Overleaf in a new browser window. Complete login on the website, including CAPTCHA or SSO.", flush=True)
         session_path = OverleafClient().login(browser=args.browser, timeout=args.timeout)
     except OverleafError as error:
-        operation = "Login" if args.command == "login" else "Listing projects"
+        operation = {"login": "Login", "list": "Listing projects", "clone": "Clone"}[args.command]
         print(f"{operation} failed: {error}", file=sys.stderr)
         return 1
     except KeyboardInterrupt:
-        operation = "Login" if args.command == "login" else "Listing projects"
+        operation = {"login": "Login", "list": "Listing projects", "clone": "Clone"}[args.command]
         print(f"\n{operation} cancelled.", file=sys.stderr)
         return 130
     print(f"Login successful. Session saved to: {session_path}")

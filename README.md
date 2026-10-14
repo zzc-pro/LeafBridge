@@ -1,6 +1,6 @@
 # LeafBridge
 
-A small command-line tool for exchanging files between local Git repositories and Overleaf. Browser login and project listing are implemented. File synchronization is still under development.
+A small command-line tool for exchanging files between local Git repositories and Overleaf. Login, project listing, and cloning are implemented. Push and pull synchronization is still under development.
 
 ## Install with Conda
 
@@ -58,6 +58,47 @@ The list shows active owned and shared projects only. Archived and trashed proje
 The client calls the dashboard's POST /api/project JSON endpoint with the saved cookies and CSRF token. Pagination uses page.size and page.lastId; retrieval stops once the number of unique projects matches totalSize, then excludes archived and trashed entries. Unexpected responses, incomplete pagination, rate limits, and expired sessions produce an error instead of a partial success.
 
 Interface references: [Overleaf routes](https://github.com/overleaf/overleaf/blob/main/services/web/app/src/router.mjs), [project list controller](https://github.com/overleaf/overleaf/blob/main/services/web/app/src/Features/Project/ProjectListController.mjs), and [dashboard API types](https://github.com/overleaf/overleaf/blob/main/services/web/types/project/dashboard/api.d.ts). These are website interfaces, so compatibility depends on Overleaf's deployed version.
+
+## Clone a project
+
+Always wrap the project name in double quotes, even when it contains no spaces:
+
+~~~powershell
+leaf clone "My Paper"
+~~~
+
+The command finds an active project by its exact name, downloads its current source ZIP, and creates a same-named directory under the current working directory. It uses the saved login session without opening a browser.
+
+Specify a different local directory when needed:
+
+~~~powershell
+leaf clone "My Paper" my-paper
+~~~
+
+The destination must not already exist, and its parent directory must exist. Duplicate project names are rejected; rename one of the projects in Overleaf before cloning. Names unsuitable for a local folder require an explicit destination.
+
+The clone creates a fresh local Git repository and preserves the downloaded files, including nested folders and binary files. It saves the project ID and source-file hashes under the ignored `.leafbridge/` directory for future synchronization:
+
+~~~text
+My Paper/
+  .git/
+  .gitignore
+  .leafbridge/
+    config.json
+    state.json
+  main.tex
+  figures/
+~~~
+
+Existing `.gitignore` rules are preserved and `/.leafbridge/` is appended. The tool does not create Git commits; review and commit the source files yourself:
+
+~~~powershell
+cd "My Paper"
+git add .
+git commit -m "Import Overleaf source"
+~~~
+
+Clone failures clean up newly created temporary files. Archive paths are checked to prevent extraction outside the destination or replacement of Git and LeafBridge metadata. The command only reads the remote project.
 
 ## Session storage
 
