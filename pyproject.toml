@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "leafbridge"
+version = "0.1.0"
+description = "A small bridge between local Git repositories and Overleaf"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["playwright>=1.40,<2"]
+
+[project.scripts]
+leaf = "leafbridge.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
