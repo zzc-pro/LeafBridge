@@ -90,6 +90,66 @@ Each repository can link to one project. The command saves the association and a
 
 Linking the same project again preserves synchronization state; linking a different project fails. With an empty baseline, differing local and remote contents are first-sync conflicts.
 
+## Inspect file differences
+
+Run inside a linked or cloned working tree:
+
+~~~powershell
+leaf status
+~~~
+
+Compares a remote ZIP snapshot, local files, and the last synchronization baseline without changing files or state. Only differences appear in the table; matching files are counted in the summary.
+
+| Status | Meaning |
+| --- | --- |
+| `local only` / `remote only` | Exists on one side without a baseline. |
+| `local modified` / `remote modified` | Only that side changed from the baseline. |
+| `conflict` | Different changes on both sides, different first-sync contents, or deletion versus modification. |
+| `missing local` / `missing remote` | Missing on that side; the other matches the baseline. |
+| `missing both` | A baseline file is absent on both sides. |
+
+Equal contents count as `same`, regardless of the baseline. Missing files are reported; deletions are not propagated.
+
+Git-ignored files, including tracked files, and paths containing any dot-prefixed component are excluded from status, push, and pull, even with force. This includes `.gitignore` and `.env`. See [Recommended .gitignore for paper repositories](#recommended-gitignore-for-paper-repositories) for LaTeX build outputs and local files.
+
+Inspection returns 0 even if conflicts exist, 1 on failure, or 130 on cancellation.
+
+## Push and pull
+
+Run inside a linked working tree or any subdirectory:
+
+~~~powershell
+leaf push
+leaf pull
+~~~
+
+Push uploads local additions and changes; pull downloads remote additions and changes. Both use the saved session and support nested folders and binary files. Files need not be committed; LeafBridge never stages or commits them.
+
+Ordinary synchronization checks all files first. Any conflict stops the operation before files or state change. Changes only at the destination are preserved and reported as skipped; use the opposite command to synchronize them.
+
+To overwrite differing destination files with the source version:
+
+~~~powershell
+leaf push --force
+leaf pull --force
+~~~
+
+Push force prefers local files; pull force prefers remote files. Identical files are not transferred, and exclusions still apply. Neither command propagates deletions. Destination-only files remain; file/folder replacement is rejected and must be resolved manually.
+
+Each successful transfer saves its baseline; equal contents also update the baseline. Failure stops the operation but keeps completed transfers. If saving state fails, run `leaf status` before retrying. Pull replaces files atomically and rejects local edits made after its initial snapshot.
+
+Avoid editing Overleaf during push: uploads cannot check for concurrent remote changes. Overleaf may normalize text encoding or line endings, causing later byte-level differences; use UTF-8 with LF line endings.
+
+Commands return 0 on success, 1 on failure, or 130 on cancellation. Check skipped paths: success does not mean every file matches.
+
+## Session storage
+
+- Windows: `%APPDATA%/leafbridge/session.json`
+- macOS: `~/Library/Application Support/leafbridge/session.json`
+- Linux: `$XDG_CONFIG_HOME/leafbridge/session.json`, defaulting to `~/.config/leafbridge/session.json`.
+
+Session files are written atomically, with mode 0600 on POSIX and configuration-directory permissions on Windows. Treat them as login credentials: do not share or commit them. Run `leaf login` again if the session expires or is revoked.
+
 ## Recommended .gitignore for paper repositories
 
 If you use Git to manage versions of your LaTeX paper locally, the following `.gitignore` is a suggested starting point for organizing your paper repository. Keep paper sources, bibliography files, and figures under version control, and ignore compilation outputs, local credentials, and LeafBridge metadata. Place these rules in the paper repository root and adapt them to your project, preserving any existing rules.
@@ -152,63 +212,3 @@ Desktop.ini
 Change `/main.pdf` if your main LaTeX file has a different name. Avoid ignoring all `*.pdf` files, since figures may be PDFs. LeafBridge also uses these rules to exclude files from `status`, `push`, and `pull`; `.gitignore` itself stays local to Git and is not synced to Overleaf.
 
 Git ignore rules do not stop Git from tracking files already committed. To stop tracking a generated file while keeping the local copy, use `git rm --cached <file>` and commit the change.
-
-## Inspect file differences
-
-Run inside a linked or cloned working tree:
-
-~~~powershell
-leaf status
-~~~
-
-Compares a remote ZIP snapshot, local files, and the last synchronization baseline without changing files or state. Only differences appear in the table; matching files are counted in the summary.
-
-| Status | Meaning |
-| --- | --- |
-| `local only` / `remote only` | Exists on one side without a baseline. |
-| `local modified` / `remote modified` | Only that side changed from the baseline. |
-| `conflict` | Different changes on both sides, different first-sync contents, or deletion versus modification. |
-| `missing local` / `missing remote` | Missing on that side; the other matches the baseline. |
-| `missing both` | A baseline file is absent on both sides. |
-
-Equal contents count as `same`, regardless of the baseline. Missing files are reported; deletions are not propagated.
-
-Git-ignored files, including tracked files, and paths containing any dot-prefixed component are excluded from status, push, and pull, even with force. This includes `.gitignore` and `.env`. See the recommended `.gitignore` above for LaTeX build outputs and local files.
-
-Inspection returns 0 even if conflicts exist, 1 on failure, or 130 on cancellation.
-
-## Push and pull
-
-Run inside a linked working tree or any subdirectory:
-
-~~~powershell
-leaf push
-leaf pull
-~~~
-
-Push uploads local additions and changes; pull downloads remote additions and changes. Both use the saved session and support nested folders and binary files. Files need not be committed; LeafBridge never stages or commits them.
-
-Ordinary synchronization checks all files first. Any conflict stops the operation before files or state change. Changes only at the destination are preserved and reported as skipped; use the opposite command to synchronize them.
-
-To overwrite differing destination files with the source version:
-
-~~~powershell
-leaf push --force
-leaf pull --force
-~~~
-
-Push force prefers local files; pull force prefers remote files. Identical files are not transferred, and exclusions still apply. Neither command propagates deletions. Destination-only files remain; file/folder replacement is rejected and must be resolved manually.
-
-Each successful transfer saves its baseline; equal contents also update the baseline. Failure stops the operation but keeps completed transfers. If saving state fails, run `leaf status` before retrying. Pull replaces files atomically and rejects local edits made after its initial snapshot.
-
-Avoid editing Overleaf during push: uploads cannot check for concurrent remote changes. Overleaf may normalize text encoding or line endings, causing later byte-level differences; use UTF-8 with LF line endings.
-
-Commands return 0 on success, 1 on failure, or 130 on cancellation. Check skipped paths: success does not mean every file matches.
-
-## Session storage
-
-- Windows: `%APPDATA%/leafbridge/session.json`
-- macOS: `~/Library/Application Support/leafbridge/session.json`
-- Linux: `$XDG_CONFIG_HOME/leafbridge/session.json`, defaulting to `~/.config/leafbridge/session.json`.
-
-Session files are written atomically, with mode 0600 on POSIX and configuration-directory permissions on Windows. Treat them as login credentials: do not share or commit them. Run `leaf login` again if the session expires or is revoked.
