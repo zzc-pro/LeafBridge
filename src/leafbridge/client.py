@@ -1,5 +1,6 @@
 """Overleaf browser login, session storage, and project queries."""
 
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -131,6 +132,7 @@ class OverleafClient:
         """Use the default user session file unless a custom path is provided."""
         self.session_path = Path(session_path) if session_path is not None else session_file()
         self._roots = {}
+        self._request = None
 
     def load(self):
         """Read and validate the session; the server may revoke cookies before expiry."""
@@ -324,13 +326,12 @@ class OverleafClient:
                 # Closing the transient read connection must not hide the original result.
                 pass
 
-    def upload(self, project_id, name, data):
-        """Upload or replace one source file, preserving its relative folder path."""
-        path = PurePosixPath(name)
-        if (not name or path.is_absolute() or path.as_posix() != name or "\\" in name
-                or any(part in {".", ".."} or ":" in part or "\x00" in part for part in name.split("/"))
-                or any(part.startswith(".") for part in path.parts)):
-            raise OverleafError("Cannot upload a hidden, unsafe, or reserved source path.")
+    @contextmanager
+    def batch(self):
+        """Share one authenticated HTTP request context across sequential uploads and always close it."""
+        if self._request is not None:
+            yield self
+            return
         session = self.load()
         sync_playwright, request_error = _playwright()
         try:
@@ -342,36 +343,55 @@ class OverleafClient:
                                         "Referer": BASE_URL + "/project", "Accept": "application/json"},
                     timeout=60_000,
                 )
+                self._request = request
                 try:
-                    folder_id = self._root(request, project_id)
-                    payload = {"name": path.name, "relativePath": name,
-                               "qqfile": {"name": path.name, "mimeType": "application/octet-stream", "buffer": data}}
-                    for prefix in ("project", "Project"):
-                        response = request.post(f"/{prefix}/{quote(project_id, safe='')}/upload",
-                                                params={"folder_id": folder_id}, max_redirects=0, multipart=payload)
-                        if response.status != 404:
-                            break
-                    if response.status == 401 or 300 <= response.status < 400:
-                        raise LoginError("Session is no longer authenticated. Run leaf login again.")
-                    if response.status == 403:
-                        raise OverleafError("Overleaf denied the upload. Check write access or run leaf login again.")
-                    if response.status == 429:
-                        raise OverleafError("Overleaf rate limit reached. Try again later.")
-                    if response.status == 404:
-                        raise OverleafError("File upload failed (HTTP 404) on both supported upload routes. Check project access or API compatibility.")
-                    if response.status != 200:
-                        raise OverleafError(f"File upload failed (HTTP {response.status}).")
-                    try:
-                        result = response.json()
-                    except ValueError:
-                        raise OverleafError("Overleaf did not return upload JSON. Check login or API compatibility.") from None
-                    if not isinstance(result, dict) or result.get("success") is not True:
-                        raise OverleafError("Overleaf did not confirm the file upload. Check file limits or API compatibility.")
+                    yield self
                 finally:
+                    self._request = None
                     try:
                         request.dispose()
                     except request_error:
                         pass
+        except request_error:
+            raise OverleafError("Unable to upload the file. Check your connection and try again.") from None
+
+    def upload(self, project_id, name, data):
+        """Upload one source file through a shared context or an isolated standalone context."""
+        path = PurePosixPath(name)
+        if (not name or path.is_absolute() or path.as_posix() != name or "\\" in name
+                or any(part in {".", ".."} or ":" in part or "\x00" in part for part in name.split("/"))
+                or any(part.startswith(".") for part in path.parts)):
+            raise OverleafError("Cannot upload a hidden, unsafe, or reserved source path.")
+        if self._request is None:
+            with self.batch():
+                return self.upload(project_id, name, data)
+        _, request_error = _playwright()
+        try:
+            request = self._request
+            folder_id = self._root(request, project_id)
+            payload = {"name": path.name, "relativePath": name,
+                       "qqfile": {"name": path.name, "mimeType": "application/octet-stream", "buffer": data}}
+            for prefix in ("project", "Project"):
+                response = request.post(f"/{prefix}/{quote(project_id, safe='')}/upload",
+                                        params={"folder_id": folder_id}, max_redirects=0, multipart=payload)
+                if response.status != 404:
+                    break
+            if response.status == 401 or 300 <= response.status < 400:
+                raise LoginError("Session is no longer authenticated. Run leaf login again.")
+            if response.status == 403:
+                raise OverleafError("Overleaf denied the upload. Check write access or run leaf login again.")
+            if response.status == 429:
+                raise OverleafError("Overleaf rate limit reached. Try again later.")
+            if response.status == 404:
+                raise OverleafError("File upload failed (HTTP 404) on both supported upload routes. Check project access or API compatibility.")
+            if response.status != 200:
+                raise OverleafError(f"File upload failed (HTTP {response.status}).")
+            try:
+                result = response.json()
+            except ValueError:
+                raise OverleafError("Overleaf did not return upload JSON. Check login or API compatibility.") from None
+            if not isinstance(result, dict) or result.get("success") is not True:
+                raise OverleafError("Overleaf did not confirm the file upload. Check file limits or API compatibility.")
         except request_error:
             raise OverleafError("Unable to upload the file. Check your connection and try again.") from None
 

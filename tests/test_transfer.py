@@ -77,6 +77,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.state()["remote.tex"], digest(b"old"))
         self.assertEqual(self.go("push")[0], 0)
         self.assertEqual(self.api.upload.call_count, 3)
+        self.assertEqual(self.api.batch.call_count, 1)
         head = subprocess.run([git.check(), "-C", str(self.root), "rev-parse", "--verify", "HEAD"],
                               capture_output=True, timeout=30)
         self.assertNotEqual(head.returncode, 0)
@@ -101,6 +102,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.state()["a.tex"], digest(b"remote edit"))
         self.assertEqual(self.go("pull")[0], 0)
         self.api.upload.assert_not_called()
+        self.api.batch.assert_not_called()
 
     def test_conflicts(self):
         """Pause the entire ordinary push or pull before any transfer or baseline update."""
@@ -119,6 +121,7 @@ class TransferTests(unittest.TestCase):
             self.assertFalse((self.root / "b-new.tex").exists())
             self.assertNotIn("a-new.tex", self.remote)
         self.api.upload.assert_not_called()
+        self.api.batch.assert_not_called()
 
     def test_first(self):
         """Require force for differing first-sync contents, then establish the chosen baseline."""
@@ -177,6 +180,7 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.state()["same.tex"], digest(b"same"))
         self.assertEqual(self.state()["gone.tex"], digest(b"gone"))
         self.api.upload.assert_not_called()
+        self.api.batch.assert_not_called()
 
     def test_upload(self):
         """Persist the first upload only when a later file upload fails."""
@@ -356,6 +360,50 @@ class UploadTests(unittest.TestCase):
         self.assertEqual(options["storage_state"]["cookies"], session()["cookies"])
         self.assertEqual(options["extra_http_headers"]["X-CSRF-Token"], "test-csrf")
         self.assertEqual(options["timeout"], 60000)
+        self.request.dispose.assert_called_once()
+
+    def test_batch(self):
+        """Reuse one request context and credential load for several sequential uploads."""
+        with self.api.batch():
+            for name in ["a.tex", "sections/b.tex", "image.bin"]:
+                self.api.upload("project-id", name, b"source")
+            self.assertIs(self.api._request, self.request)
+            self.request.dispose.assert_not_called()
+        self.assertEqual(self.request.post.call_count, 3)
+        self.api.load.assert_called_once()
+        self.playwright.request.new_context.assert_called_once()
+        self.request.dispose.assert_called_once()
+        self.assertIsNone(self.api._request)
+
+    def test_nested(self):
+        """Keep a nested batch from disposing the outer batch's request context."""
+        with self.api.batch():
+            with self.api.batch():
+                self.api.upload("project-id", "main.tex", b"source")
+            self.assertIs(self.api._request, self.request)
+            self.request.dispose.assert_not_called()
+        self.playwright.request.new_context.assert_called_once()
+        self.request.dispose.assert_called_once()
+
+    def test_cleanup(self):
+        """Dispose a failed batch and create a fresh context for the next standalone upload."""
+        self.request.post.side_effect = BrowserError("private-cookie")
+        with self.assertRaisesRegex(OverleafError, "Check your connection"), self.api.batch():
+            self.api.upload("project-id", "main.tex", b"source")
+        self.assertIsNone(self.api._request)
+        self.request.dispose.assert_called_once()
+        self.request.post.side_effect = None
+        self.api.upload("project-id", "main.tex", b"source")
+        self.assertEqual(self.api.load.call_count, 2)
+        self.assertEqual(self.playwright.request.new_context.call_count, 2)
+        self.assertEqual(self.request.dispose.call_count, 2)
+
+    def test_cancel(self):
+        """Close the shared HTTP context when an upload is interrupted."""
+        self.request.post.side_effect = KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt), self.api.batch():
+            self.api.upload("project-id", "main.tex", b"source")
+        self.assertIsNone(self.api._request)
         self.request.dispose.assert_called_once()
 
     def test_routes(self):

@@ -167,6 +167,8 @@ leaf pull
 
 `leaf push` uploads local additions and modifications. `leaf pull` downloads remote additions and modifications. They use the saved login session without opening a browser. Files do not need to be committed; Git remains responsible for your local history, and LeafBridge never stages files or creates commits.
 
+After comparison and path validation, a push with pending uploads creates one Playwright HTTP request context for the entire upload phase. All files share that context and its connections. Uploads remain sequential, each confirmed file immediately saves its baseline, and the context closes on success, failure, or cancellation. A push with no changes or conflicts creates no upload context. The initial ZIP comparison still uses a separate download context.
+
 Each command first compares all selected files against the synchronization baseline. If any conflicts exist, the entire ordinary synchronization stops before changing files or state, lists the conflicting paths, and returns exit code 1:
 
 ~~~text
@@ -218,3 +220,14 @@ python -m unittest discover -s tests -v
 Tests simulate the browser and HTTP responses. They do not read real credentials or connect to Overleaf. Actual CAPTCHA and SSO behavior requires interactive verification.
 
 Browser and request behavior follows the [Playwright browser API](https://playwright.dev/python/docs/api/class-browsertype#browser-type-launch-persistent-context) and [request API](https://playwright.dev/python/docs/api/class-apirequestcontext).
+
+## Local speed benchmark
+
+~~~powershell
+conda activate leafbridge
+python benchmarks/push_speed.py --baseline e03b0c9 --repeats 3
+~~~
+
+The benchmark compares the committed implementation with the working tree against a loopback-only HTTP server using real Playwright request contexts. It uses fake credentials, temporary Git repositories, and 8 KiB source files, and never reads your saved session or contacts Overleaf. It measures the full push operation, including Git selection, ZIP download, hashing, multipart uploads, root folder lookup, and per-file baseline saves. Every trial verifies remote bytes, transfer counts, saved fingerprints, and request cleanup.
+
+Workloads cover unchanged content and 1, 10, or 30 changed files. Both versions are warmed up, paired trial order alternates, and the summary uses the median of three trials. Raw timings, runtime/context counts, and median summaries are saved to `.cache/push-speed.json`. These loopback timings measure local request setup overhead; actual Overleaf throughput also depends on network latency, bandwidth, server load, and rate limits.

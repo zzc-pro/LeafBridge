@@ -238,25 +238,26 @@ def run(api, root, project_id, base, direction, force=False, report=None):
     transferred = 0
     name = None
     try:
-        for name in changes:
-            if direction == "push":
-                target = _target(root, name)
-                content = target.read_bytes()
-                if hashlib.sha256(content).hexdigest() != local[name]:
-                    raise OverleafError(f"Local file changed during synchronization: {name!r}. Run leaf status and retry.")
-                api.upload(project_id, name, content)
-            else:
-                with zipfile.ZipFile(io.BytesIO(data)) as archive:
-                    entry = next(entry for entry in archive.infolist() if not entry.is_dir()
-                                 and PurePosixPath(entry.filename).as_posix() == name)
-                    content = archive.read(entry)
-                _write(root, name, content, local.get(name))
-            updated = {**saved, name: source[name]}
-            _save(root, updated)
-            saved = updated
-            transferred += 1
-            if report is not None:
-                report("Uploaded" if direction == "push" else "Downloaded", name)
+        with api.batch() if direction == "push" and changes else nullcontext():
+            for name in changes:
+                if direction == "push":
+                    target = _target(root, name)
+                    content = target.read_bytes()
+                    if hashlib.sha256(content).hexdigest() != local[name]:
+                        raise OverleafError(f"Local file changed during synchronization: {name!r}. Run leaf status and retry.")
+                    api.upload(project_id, name, content)
+                else:
+                    with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                        entry = next(entry for entry in archive.infolist() if not entry.is_dir()
+                                     and PurePosixPath(entry.filename).as_posix() == name)
+                        content = archive.read(entry)
+                    _write(root, name, content, local.get(name))
+                updated = {**saved, name: source[name]}
+                _save(root, updated)
+                saved = updated
+                transferred += 1
+                if report is not None:
+                    report("Uploaded" if direction == "push" else "Downloaded", name)
         for name, label in rows.items():
             if label == "same" and saved.get(name) != local[name]:
                 saved[name] = local[name]
