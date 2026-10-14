@@ -90,6 +90,69 @@ Each repository can link to one project. The command saves the association and a
 
 Linking the same project again preserves synchronization state; linking a different project fails. With an empty baseline, differing local and remote contents are first-sync conflicts.
 
+## Recommended .gitignore for paper repositories
+
+If you use Git to manage versions of your LaTeX paper locally, the following `.gitignore` is a suggested starting point for organizing your paper repository. Keep paper sources, bibliography files, and figures under version control, and ignore compilation outputs, local credentials, and LeafBridge metadata. Place these rules in the paper repository root and adapt them to your project, preserving any existing rules.
+
+~~~gitignore
+# LaTeX compilation files
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.lof
+*.lot
+*.fls
+*.fdb_latexmk
+*.synctex
+*.synctex.gz
+*.xdv
+*.dvi
+*.nav
+*.snm
+*.vrb
+*.bcf
+*.run.xml
+*.loa
+*.lol
+*.ilg
+*.ind
+*.idx
+*.glg
+*.glo
+*.gls
+*.acn
+*.acr
+*.alg
+*.thm
+_minted*/
+
+# Compiled paper (keep PDF figures under version control)
+/main.pdf
+
+# Local authentication and environment files
+.olauth
+.env
+.env.*
+!.env.example
+
+# Editor backups and operating system files
+*~
+*.swp
+*.swo
+*.bak
+.DS_Store
+Thumbs.db
+Desktop.ini
+/.leafbridge/
+~~~
+
+Change `/main.pdf` if your main LaTeX file has a different name. Avoid ignoring all `*.pdf` files, since figures may be PDFs. LeafBridge also uses these rules to exclude files from `status`, `push`, and `pull`; `.gitignore` itself stays local to Git and is not synced to Overleaf.
+
+Git ignore rules do not stop Git from tracking files already committed. To stop tracking a generated file while keeping the local copy, use `git rm --cached <file>` and commit the change.
+
 ## Inspect file differences
 
 Run inside a linked or cloned working tree:
@@ -110,7 +173,7 @@ Compares a remote ZIP snapshot, local files, and the last synchronization baseli
 
 Equal contents count as `same`, regardless of the baseline. Missing files are reported; deletions are not propagated.
 
-Git-ignored files, including tracked files, and paths containing any dot-prefixed component are excluded from status, push, and pull, even with force. This includes `.gitignore` and `.env`. Add LaTeX build outputs such as `*.aux`, `*.log`, and `main.pdf` to your `.gitignore`.
+Git-ignored files, including tracked files, and paths containing any dot-prefixed component are excluded from status, push, and pull, even with force. This includes `.gitignore` and `.env`. See the recommended `.gitignore` above for LaTeX build outputs and local files.
 
 Inspection returns 0 even if conflicts exist, 1 on failure, or 130 on cancellation.
 
