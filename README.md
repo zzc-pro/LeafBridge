@@ -90,6 +90,16 @@ Each repository can link to one project. The command saves the association and a
 
 Linking the same project again preserves synchronization state; linking a different project fails. With an empty baseline, differing local and remote contents are first-sync conflicts.
 
+To unlink this repository, run from the working tree or any subdirectory:
+
+~~~powershell
+leaf remote remove
+~~~
+
+This offline command deletes only `.leafbridge/config.json` and `.leafbridge/state.json`, then removes the empty metadata directory. It preserves paper files, Git history and remotes, `.gitignore`, the saved login session, and the Overleaf project. Running it again succeeds without changes. Incomplete or invalid JSON metadata can also be removed; unexpected files or unsafe paths are rejected before deletion.
+
+You can then use `leaf remote add "Another Paper"` to link another project with an empty synchronization baseline.
+
 ## Inspect file differences
 
 Run inside a linked or cloned working tree:
@@ -108,7 +118,7 @@ Compares a remote ZIP snapshot, local files, and the last synchronization baseli
 | `missing local` / `missing remote` | Missing on that side; the other matches the baseline. |
 | `missing both` | A baseline file is absent on both sides. |
 
-Equal contents count as `same`, regardless of the baseline. Missing files are reported; deletions are not propagated.
+Equal contents count as `same`, regardless of the baseline. Status only reports missing files; it never changes or deletes files.
 
 Git-ignored files, including tracked files, and paths containing any dot-prefixed component are excluded from status, push, and pull, even with force. This includes `.gitignore` and `.env`. See [Recommended .gitignore for paper repositories](#recommended-gitignore-for-paper-repositories) for LaTeX build outputs and local files.
 
@@ -127,16 +137,22 @@ Push uploads local additions and changes; pull downloads remote additions and ch
 
 Ordinary synchronization checks all files first. Any conflict stops the operation before files or state change. Changes only at the destination are preserved and reported as skipped; use the opposite command to synchronize them.
 
-To overwrite differing destination files with the source version:
+Choose the command according to which side should be the source:
 
-~~~powershell
-leaf push --force
-leaf pull --force
-~~~
+| Command | Source | Effect on the destination |
+| --- | --- | --- |
+| `leaf push` | Local | Upload local additions and changes; preserve remote-only files and report conflicts. |
+| `leaf pull` | Overleaf | Download remote additions and changes; preserve local-only files and report conflicts. |
+| `leaf push --force` | Local | Overwrite differing remote files and delete remote-only files. |
+| `leaf pull --force` | Overleaf | Overwrite differing local files and delete local-only files, including uncommitted and untracked files. |
 
-Push force prefers local files; pull force prefers remote files. Identical files are not transferred, and exclusions still apply. Neither command propagates deletions. Destination-only files remain; file/folder replacement is rejected and must be resolved manually.
+**`--force` includes deletion.** It mirrors the selected source files even on the first sync, when there is no baseline. Both forced commands print the deletion list before changing files and proceed without another confirmation prompt. Identical files are not transferred.
 
-Each successful transfer saves its baseline; equal contents also update the baseline. Failure stops the operation but keeps completed transfers. If saving state fails, run `leaf status` before retrying. Pull replaces files atomically and rejects local edits made after its initial snapshot.
+For example, if `old.tex` exists only on Overleaf, `leaf push` preserves it and reports it as skipped; `leaf push --force` deletes it. If `draft.tex` exists only locally, `leaf pull` preserves it; `leaf pull --force` deletes it. Run `leaf status` to inspect differences before choosing a direction.
+
+Git-ignored files and hidden paths remain excluded from overwrites and deletions. Empty directories may remain; file/folder replacement and paths differing only in case are rejected and must be resolved manually.
+
+Transfers finish before planned deletions start. Each successful transfer or deletion saves its baseline; equal contents also update the baseline. Force removes obsolete baseline entries for files missing on both sides. Failure stops the operation but keeps completed changes. If saving state fails, run `leaf status` before retrying. Pull replaces files atomically and checks local contents again before overwriting or deleting them.
 
 Avoid editing Overleaf during push: uploads cannot check for concurrent remote changes. Overleaf may normalize text encoding or line endings, causing later byte-level differences; use UTF-8 with LF line endings.
 

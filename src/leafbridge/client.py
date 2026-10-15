@@ -132,6 +132,7 @@ class OverleafClient:
         """Use the default user session file unless a custom path is provided."""
         self.session_path = Path(session_path) if session_path is not None else session_file()
         self._roots = {}
+        self._trees = {}
         self._request = None
 
     def load(self):
@@ -316,6 +317,7 @@ class OverleafClient:
                             or not isinstance(folders[0].get("_id"), str) or not folders[0]["_id"]):
                         raise OverleafError("Unexpected project root folder metadata.")
                     self._roots[project_id] = folders[0]["_id"]
+                    self._trees[project_id] = folders[0]
                     return self._roots[project_id]
             raise OverleafError("Timed out reading the project root folder. Check Overleaf connectivity.")
         finally:
@@ -328,11 +330,13 @@ class OverleafClient:
 
     @contextmanager
     def batch(self):
-        """Share one authenticated HTTP request context across sequential uploads and always close it."""
+        """Share one authenticated HTTP context across uploads and deletions, then close it."""
         if self._request is not None:
             yield self
             return
         session = self.load()
+        self._roots.clear()
+        self._trees.clear()
         sync_playwright, request_error = _playwright()
         try:
             with sync_playwright() as playwright:
@@ -353,7 +357,53 @@ class OverleafClient:
                     except request_error:
                         pass
         except request_error:
-            raise OverleafError("Unable to upload the file. Check your connection and try again.") from None
+            raise OverleafError("Unable to synchronize files. Check your connection and try again.") from None
+
+    def _entity(self, project_id, name):
+        """Resolve an exact file path to its document or binary-file ID."""
+        self._root(self._request, project_id)
+        folder = self._trees.get(project_id)
+        try:
+            for part in PurePosixPath(name).parts[:-1]:
+                matches = [item for item in folder.get("folders", []) if item["name"] == part]
+                if len(matches) != 1:
+                    raise ValueError
+                folder = matches[0]
+            matches = [(kind, item) for field, kind in [("docs", "doc"), ("fileRefs", "file")]
+                       for item in folder.get(field, []) if item["name"] == PurePosixPath(name).name]
+            if len(matches) != 1 or not isinstance(matches[0][1].get("_id"), str) or not matches[0][1]["_id"]:
+                raise ValueError
+            return matches[0][0], matches[0][1]["_id"]
+        except (AttributeError, KeyError, TypeError, ValueError):
+            raise OverleafError(f"Unable to resolve remote file for deletion: {name!r}. Run leaf status and retry.") from None
+
+    def delete(self, project_id, name):
+        """Delete one exact remote document or binary file, requiring HTTP confirmation."""
+        path = PurePosixPath(name)
+        if (not name or path.is_absolute() or path.as_posix() != name or "\\" in name
+                or any(part in {".", ".."} or ":" in part or "\x00" in part for part in name.split("/"))
+                or any(part.startswith(".") for part in path.parts)):
+            raise OverleafError("Cannot delete a hidden, unsafe, or reserved source path.")
+        if self._request is None:
+            with self.batch():
+                return self.delete(project_id, name)
+        _, request_error = _playwright()
+        try:
+            kind, entity_id = self._entity(project_id, name)
+            response = self._request.delete(
+                f"/project/{quote(project_id, safe='')}/{kind}/{quote(entity_id, safe='')}",
+                max_redirects=0,
+            )
+            if response.status == 401 or 300 <= response.status < 400:
+                raise LoginError("Session is no longer authenticated. Run leaf login again.")
+            if response.status == 403:
+                raise OverleafError("Overleaf denied the deletion. Check write access or run leaf login again.")
+            if response.status == 429:
+                raise OverleafError("Overleaf rate limit reached. Try again later.")
+            if response.status != 204:
+                raise OverleafError(f"File deletion was not confirmed (HTTP {response.status}). Run leaf status before retrying.")
+        except request_error:
+            raise OverleafError("Unable to delete the file. Check your connection and run leaf status before retrying.") from None
 
     def upload(self, project_id, name, data):
         """Upload one source file through a shared context or an isolated standalone context."""

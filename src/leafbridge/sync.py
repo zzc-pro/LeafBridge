@@ -171,7 +171,7 @@ def _save(root, files):
             os.fsync(stream.fileno())
         os.replace(temporary, target)
     except OSError:
-        raise OverleafError("Unable to save synchronization state. A file may already have transferred; run leaf status before retrying.") from None
+        raise OverleafError("Unable to save synchronization state. A file may already have transferred or been deleted; run leaf status before retrying.") from None
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -199,7 +199,7 @@ def _write(root, name, data, expected):
 
 
 def run(api, root, project_id, base, direction, force=False, report=None):
-    """Sync one direction, stopping before all writes on conflicts unless force is explicit."""
+    """Sync one direction; force mirrors selected source files, including deletions."""
     if direction not in {"push", "pull"}:
         raise OverleafError("Synchronization direction must be push or pull.")
     local, remote, rows, data = _scan(api, root, project_id, base)
@@ -212,9 +212,16 @@ def run(api, root, project_id, base, direction, force=False, report=None):
     labels = {"local only", "local modified"} if direction == "push" else {"remote only", "remote modified"}
     changes = [name for name, label in rows.items() if name in source and source.get(name) != destination.get(name)
                and (force or label in labels)]
-    skipped = {name: label for name, label in rows.items() if label != "same" and name not in changes}
+    deletions = [name for name in rows if name in destination and name not in source] if force else []
+    forgotten = [name for name, label in rows.items() if label == "missing both"] if force else []
+    skipped = {name: label for name, label in rows.items()
+               if label != "same" and name not in changes and name not in deletions and name not in forgotten}
     # Validate every destination before touching any file, including structural conflicts.
     try:
+        for name in deletions:
+            target = _target(root, name)
+            if _hash(target) != local.get(name):
+                raise OverleafError(f"Local file changed during synchronization: {name!r}. Run leaf status and retry.")
         for name in changes:
             if direction == "pull":
                 target = _target(root, name)
@@ -238,7 +245,10 @@ def run(api, root, project_id, base, direction, force=False, report=None):
     transferred = 0
     name = None
     try:
-        with api.batch() if direction == "push" and changes else nullcontext():
+        if report is not None:
+            for name in deletions:
+                report("Will delete remote" if direction == "push" else "Will delete local", name)
+        with api.batch() if direction == "push" and (changes or deletions) else nullcontext():
             for name in changes:
                 if direction == "push":
                     target = _target(root, name)
@@ -258,14 +268,32 @@ def run(api, root, project_id, base, direction, force=False, report=None):
                 transferred += 1
                 if report is not None:
                     report("Uploaded" if direction == "push" else "Downloaded", name)
+            # Transfer first so an upload/download failure does not trigger planned deletions.
+            for name in deletions:
+                target = _target(root, name)
+                if _hash(target) != local.get(name):
+                    raise OverleafError(f"Local file changed during synchronization: {name!r}. Run leaf status and retry.")
+                if direction == "push":
+                    api.delete(project_id, name)
+                else:
+                    target.unlink()
+                updated = {key: value for key, value in saved.items() if key != name}
+                _save(root, updated)
+                saved = updated
+                transferred += 1
+                if report is not None:
+                    report("Deleted remote" if direction == "push" else "Deleted local", name)
         for name, label in rows.items():
             if label == "same" and saved.get(name) != local[name]:
                 saved[name] = local[name]
                 _save(root, saved)
+        if forgotten:
+            saved = {key: value for key, value in saved.items() if key not in forgotten}
+            _save(root, saved)
     except (OverleafError, OSError, ValueError, zipfile.BadZipFile, RuntimeError, zlib.error) as error:
         reason = str(error) if isinstance(error, OverleafError) else "Check file permissions and downloaded contents."
         failed = f" File: {json.dumps(name, ensure_ascii=False)}." if name is not None else ""
-        raise OverleafError(f"Synchronization stopped after {transferred} completed file transfer(s).{failed} {reason}") from None
+        raise OverleafError(f"Synchronization stopped after {transferred} completed file operation(s).{failed} {reason}") from None
     return transferred, skipped
 
 

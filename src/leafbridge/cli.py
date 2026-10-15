@@ -67,6 +67,31 @@ def add(api, name=None, project_id=None, path=None):
     return root, project, True
 
 
+def remove(path=None):
+    """Remove only local association metadata without contacting Overleaf."""
+    root = git.root(path)
+    metadata = root / ".leafbridge"
+    try:
+        if metadata.is_symlink() or metadata.resolve().parent != root:
+            raise OverleafError("The repository .leafbridge must not be a symbolic link or point outside the repository.")
+        if not metadata.exists():
+            return root, False
+        if not metadata.is_dir():
+            raise OverleafError("The repository .leafbridge must be a directory.")
+        entries = list(metadata.iterdir())
+        for entry in entries:
+            if (entry.name not in {"config.json", "state.json"} or entry.is_symlink()
+                    or entry.resolve().parent != metadata.resolve() or not entry.is_file()):
+                raise OverleafError("Unexpected or unsafe files in .leafbridge. Check the directory before removing the association.")
+        # Do not parse JSON: removal also allows recovery from incomplete metadata.
+        for entry in entries:
+            entry.unlink()
+        metadata.rmdir()
+    except OSError:
+        raise OverleafError("Unable to remove the association. Check repository permissions and .leafbridge before retrying.") from None
+    return root, True
+
+
 def _read(root, filename):
     """Read repository metadata only from regular files inside the metadata directory."""
     try:
@@ -113,9 +138,9 @@ def transfer(api, direction, force=False, path=None):
                               report=lambda action, name: print(f"{action}: {json.dumps(name, ensure_ascii=False)}", flush=True))
     for name, label in skipped.items():
         print(f"Skipped ({label}): {json.dumps(name, ensure_ascii=False)}")
-    print(f"{direction.capitalize()} complete. Transferred: {count}; skipped differences: {len(skipped)}.")
+    print(f"{direction.capitalize()} complete. File operations: {count}; skipped differences: {len(skipped)}.")
     if skipped:
-        print("Skipped files were preserved. Source deletions are not propagated; other changes may need the opposite direction.")
+        print("Skipped files were preserved. Use --force to mirror the source, including deletion of destination-only files.")
     return 0
 
 
@@ -133,22 +158,30 @@ def main(argv=None):
     for direction in ["push", "pull"]:
         command = commands.add_parser(direction, help="Upload local changes to Overleaf." if direction == "push"
                                       else "Download Overleaf changes to the local repository.")
-        command.add_argument("--force", action="store_true", help="Prefer source contents for differing files; never propagate deletions.")
+        command.add_argument("--force", action="store_true", help="Mirror source files: overwrite differences and delete destination-only files; keep excluded files.")
     clone_command = commands.add_parser("clone", help="Clone an active Overleaf project into a local Git repository.")
     clone_command.add_argument("name", help="Exact project name; always wrap it in double quotes.")
     clone_command.add_argument("directory", nargs="?", help="Local directory (default: the project name).")
-    remote = commands.add_parser("remote", help="Associate a local repository with Overleaf.")
+    remote = commands.add_parser("remote", help="Manage the local repository's Overleaf association.")
     actions = remote.add_subparsers(dest="action", required=True)
     add_command = actions.add_parser("add", help="Associate this Git working tree with an active project.")
     add_command.add_argument("name", nargs="?", help="Exact project name, wrapped in double quotes.")
     add_command.add_argument("--id", dest="project_id", help="Project ID from leaf list, instead of a name.")
+    actions.add_parser("remove", help="Remove the local association and synchronization baseline; keep paper files.")
     args = parser.parse_args(argv)
-    if args.command == "remote" and ((args.name is None) == (args.project_id is None)
+    if args.command == "remote" and args.action == "add" and ((args.name is None) == (args.project_id is None)
                                       or not (args.name or args.project_id)):
         add_command.error("specify an exact project name or --id, but not both")
     operation = {"login": "Login", "list": "Listing projects", "clone": "Clone", "remote": "Remote add",
                  "status": "Status", "push": "Push", "pull": "Pull"}[args.command]
+    if args.command == "remote":
+        operation = f"Remote {args.action}"
     try:
+        if args.command == "remote" and args.action == "remove":
+            path, removed = remove()
+            message = "Project association removed" if removed else "No project association found"
+            print(f"{message}: {path}")
+            return 0
         if args.command in {"push", "pull"}:
             return transfer(OverleafClient(), args.command, args.force)
         if args.command == "status":
