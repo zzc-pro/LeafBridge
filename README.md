@@ -118,7 +118,7 @@ Compares a remote ZIP snapshot, local files, and the last synchronization baseli
 | `missing local` / `missing remote` | Missing on that side; the other matches the baseline. |
 | `missing both` | A baseline file is absent on both sides. |
 
-Equal contents count as `same`, regardless of the baseline. Status only reports missing files; it never changes or deletes files.
+Equal contents count as `same`, regardless of the baseline. For supported UTF-8 source files (including `.tex`, `.bib`, `.sty`, `.cls`, and `.txt`), comparison uses Overleaf's LF line endings: CRLF versus LF alone is not a modification or conflict. Spaces, final newlines, and actual text changes remain significant. Binary assets, invalid UTF-8, and unknown file types are compared byte for byte. Status only reports differences; it never rewrites files or synchronization state.
 
 Git-ignored files, including tracked files, and paths containing any dot-prefixed component are excluded from status, push, and pull, even with force. This includes `.gitignore` and `.env`. See [Recommended .gitignore for paper repositories](#recommended-gitignore-for-paper-repositories) for LaTeX build outputs and local files.
 
@@ -146,7 +146,7 @@ Choose the command according to which side should be the source:
 | `leaf push --force` | Local | Overwrite differing remote files and delete remote-only files. |
 | `leaf pull --force` | Overleaf | Overwrite differing local files and delete local-only files, including uncommitted and untracked files. |
 
-**`--force` includes deletion.** It mirrors the selected source files even on the first sync, when there is no baseline. Both forced commands print the deletion list before changing files and proceed without another confirmation prompt. Identical files are not transferred.
+**`--force` includes deletion.** It mirrors the selected source files even on the first sync, when there is no baseline. Both forced commands print the deletion list before changing files and proceed without another confirmation prompt. Files that compare as identical, including supported text that differs only in CRLF/LF line endings, are not transferred even with `--force`.
 
 For example, if `old.tex` exists only on Overleaf, `leaf push` preserves it and reports it as skipped; `leaf push --force` deletes it. If `draft.tex` exists only locally, `leaf pull` preserves it; `leaf pull --force` deletes it. Run `leaf status` to inspect differences before choosing a direction.
 
@@ -154,7 +154,9 @@ Git-ignored files and hidden paths remain excluded from overwrites and deletions
 
 Transfers finish before planned deletions start. Each successful transfer or deletion saves its baseline; equal contents also update the baseline. Force removes obsolete baseline entries for files missing on both sides. Failure stops the operation but keeps completed changes. If saving state fails, run `leaf status` before retrying. Pull replaces files atomically and checks local contents again before overwriting or deleting them.
 
-Avoid editing Overleaf during push: uploads cannot check for concurrent remote changes. Overleaf may normalize text encoding or line endings, causing later byte-level differences; use UTF-8 with LF line endings.
+Supported UTF-8 source text is uploaded, downloaded, and cloned using LF line endings. Existing files that differ only in CRLF/LF are left untouched, so inspection or a no-op pull does not create Git changes. Synchronization fingerprints also use LF, while concurrent-edit checks still use the original bytes. Older version-1 raw LF/CRLF baselines remain supported and are updated during a successful push or pull; no manual state reset or force operation is required. A legacy mixed-line-ending baseline that cannot be matched safely may still require manual conflict resolution.
+
+Avoid editing Overleaf during push: uploads cannot check for concurrent remote changes. Other encoding conversions are not ignored. LeafBridge does not change Git's `core.autocrlf`, editor settings, or existing Git status; use LF consistently in the working tree if you also want to avoid Git-only formatting differences.
 
 Commands return 0 on success, 1 on failure, or 130 on cancellation. Check skipped paths: success does not mean every file matches.
 

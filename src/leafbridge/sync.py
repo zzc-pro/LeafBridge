@@ -16,6 +16,44 @@ from . import git
 from .client import BASE_URL, OverleafError
 
 
+# Only source formats that Overleaf edits as text participate in LF comparison.
+# Unknown files (including binary assets) keep exact byte-level fingerprints.
+_TEXT_SUFFIXES = frozenset({
+    ".tex", ".ltx", ".bib", ".sty", ".cls", ".bst", ".bbx", ".cbx",
+    ".lbx", ".def", ".cfg", ".clo", ".dtx", ".ins", ".tikz", ".pgf",
+    ".txt", ".md", ".markdown", ".csv", ".tsv", ".json", ".yaml", ".yml",
+    ".xml", ".html", ".htm", ".css", ".js", ".py", ".r", ".lua", ".sh",
+})
+
+
+def _lf_content(name, content):
+    """Use Overleaf's LF convention for UTF-8 source text, never binary data."""
+    if PurePosixPath(name).suffix.lower() not in _TEXT_SUFFIXES or b"\x00" in content:
+        return content
+    try:
+        content.decode("utf-8")
+    except UnicodeDecodeError:
+        return content
+    return content.replace(b"\r\n", b"\n")
+
+
+def _fingerprint(name, content):
+    """Return an LF fingerprint and compatible legacy raw fingerprints."""
+    normalized = _lf_content(name, content)
+    digest = hashlib.sha256(normalized).hexdigest()
+    aliases = {hashlib.sha256(content).hexdigest(), digest}
+    if PurePosixPath(name).suffix.lower() in _TEXT_SUFFIXES and b"\n" in normalized:
+        # Require valid text even when normalization did not change the bytes.
+        if b"\x00" not in normalized:
+            try:
+                normalized.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+            else:
+                aliases.add(hashlib.sha256(normalized.replace(b"\n", b"\r\n")).hexdigest())
+    return digest, aliases
+
+
 def _path(name):
     """Validate a relative source-file path before reading or extracting its contents."""
     if (not isinstance(name, str) or not name or "\\" in name
@@ -130,7 +168,30 @@ def _scan(api, root, project_id, base):
         remote = _unpack(data)
         names = {name for name in selected | remote.keys() | base.keys() if not _hidden(name)}
         names -= git.ignored(root, names)
-        rows = {name: compare(local.get(name), remote.get(name), base.get(name)) for name in sorted(names)}
+        local_content, remote_content = dict(local), dict(remote)
+        rows = {}
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            entries = {PurePosixPath(entry.filename).as_posix(): entry
+                       for entry in archive.infolist() if not entry.is_dir()}
+            for name in sorted(names):
+                baseline = base.get(name)
+                local_aliases = {local.get(name)}
+                remote_aliases = {remote.get(name)}
+                if PurePosixPath(name).suffix.lower() in _TEXT_SUFFIXES:
+                    if name in local:
+                        content = _target(root, name).read_bytes()
+                        if hashlib.sha256(content).hexdigest() != local[name]:
+                            raise OverleafError(f"Local file changed during inspection: {name!r}. Run leaf status and retry.")
+                        local_content[name], local_aliases = _fingerprint(name, content)
+                    if name in remote:
+                        remote_content[name], remote_aliases = _fingerprint(name, archive.read(entries[name]))
+                # Version-1 baselines stored raw hashes. Map a matching old LF/CRLF
+                # fingerprint to its canonical value without mutating status state.
+                if baseline is not None and baseline in local_aliases:
+                    baseline = local_content.get(name)
+                elif baseline is not None and baseline in remote_aliases:
+                    baseline = remote_content.get(name)
+                rows[name] = compare(local_content.get(name), remote_content.get(name), baseline)
         present = (local.keys() | remote.keys()) & names
         seen = {}
         for name in present:
@@ -141,7 +202,7 @@ def _scan(api, root, project_id, base):
             for parent in PurePosixPath(name).parents:
                 if parent.as_posix() in present:
                     rows[name] = rows[parent.as_posix()] = "conflict"
-        return local, remote, rows, data
+        return local, remote, rows, data, local_content, remote_content
     except OverleafError:
         raise
     except (OSError, ValueError, zipfile.BadZipFile, RuntimeError, NotImplementedError, zlib.error):
@@ -202,15 +263,17 @@ def run(api, root, project_id, base, direction, force=False, report=None):
     """Sync one direction; force mirrors selected source files, including deletions."""
     if direction not in {"push", "pull"}:
         raise OverleafError("Synchronization direction must be push or pull.")
-    local, remote, rows, data = _scan(api, root, project_id, base)
+    local, remote, rows, data, local_content, remote_content = _scan(api, root, project_id, base)
     conflicts = [name for name, label in rows.items() if label == "conflict"]
     if conflicts and not force:
         paths = "\n".join("  " + json.dumps(name, ensure_ascii=False) for name in conflicts)
         raise OverleafError(f"Conflicts detected. Synchronization paused; no files or state were changed.\n{paths}\n"
                             f"Resolve conflicts or use leaf {direction} --force to prefer the source side.")
     source, destination = (local, remote) if direction == "push" else (remote, local)
+    fingerprints = local_content if direction == "push" else remote_content
     labels = {"local only", "local modified"} if direction == "push" else {"remote only", "remote modified"}
-    changes = [name for name, label in rows.items() if name in source and source.get(name) != destination.get(name)
+    changes = [name for name, label in rows.items() if name in source and label != "same"
+               and source.get(name) != destination.get(name)
                and (force or label in labels)]
     deletions = [name for name in rows if name in destination and name not in source] if force else []
     forgotten = [name for name, label in rows.items() if label == "missing both"] if force else []
@@ -255,14 +318,14 @@ def run(api, root, project_id, base, direction, force=False, report=None):
                     content = target.read_bytes()
                     if hashlib.sha256(content).hexdigest() != local[name]:
                         raise OverleafError(f"Local file changed during synchronization: {name!r}. Run leaf status and retry.")
-                    api.upload(project_id, name, content)
+                    api.upload(project_id, name, _lf_content(name, content))
                 else:
                     with zipfile.ZipFile(io.BytesIO(data)) as archive:
                         entry = next(entry for entry in archive.infolist() if not entry.is_dir()
                                      and PurePosixPath(entry.filename).as_posix() == name)
                         content = archive.read(entry)
-                    _write(root, name, content, local.get(name))
-                updated = {**saved, name: source[name]}
+                    _write(root, name, _lf_content(name, content), local.get(name))
+                updated = {**saved, name: fingerprints[name]}
                 _save(root, updated)
                 saved = updated
                 transferred += 1
@@ -284,8 +347,8 @@ def run(api, root, project_id, base, direction, force=False, report=None):
                 if report is not None:
                     report("Deleted remote" if direction == "push" else "Deleted local", name)
         for name, label in rows.items():
-            if label == "same" and saved.get(name) != local[name]:
-                saved[name] = local[name]
+            if label == "same" and saved.get(name) != local_content[name]:
+                saved[name] = local_content[name]
                 _save(root, saved)
         if forgotten:
             saved = {key: value for key, value in saved.items() if key not in forgotten}
@@ -322,6 +385,14 @@ def clone(api, name, path=None):
             work = Path(temporary) / "project"
             work.mkdir()
             hashes = _unpack(data, work)
+            for filename in hashes:
+                if PurePosixPath(filename).suffix.lower() in _TEXT_SUFFIXES:
+                    source = work.joinpath(*PurePosixPath(filename).parts)
+                    content = source.read_bytes()
+                    normalized = _lf_content(filename, content)
+                    if normalized != content:
+                        source.write_bytes(normalized)
+                    hashes[filename] = hashlib.sha256(normalized).hexdigest()
             git.init(work)
             metadata = work / ".leafbridge"
             metadata.mkdir()
